@@ -79,13 +79,14 @@ python3 main.py \
   --limit 1 \
   --model-name Qwen/Qwen2.5-0.5B-Instruct \
   --grammar-name triton_lexical \
+  --max-new-tokens 256 \
   --output outputs/predictions.jsonl
 ```
 
 Or let the script clone TritonBench into `vendor/TritonBench`:
 
 ```bash
-python3 main.py --limit 1
+python3 main.py --limit 1 --max-new-tokens 256
 ```
 
 The generated file is written to `outputs/predictions.jsonl` by default.

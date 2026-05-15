@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=8192,
+        default=512,
         help="Maximum generated tokens per benchmark item.",
     )
     return parser.parse_args()
