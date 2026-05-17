@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 
@@ -30,6 +28,8 @@ PROMPT_HEADER = (
 
 
 def parse_args() -> argparse.Namespace:
+    provider_default = os.environ.get("LLM_PROVIDER", "modal-vllm")
+    model_default = resolve_model(provider_default, None)
     parser = argparse.ArgumentParser(
         description="Generate predictions.jsonl with an OpenAI-compatible LLM endpoint."
     )
@@ -40,14 +40,25 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing TritonBench_T_<simp|comp>_alpac_v1.json.",
     )
     parser.add_argument(
+        "--provider",
+        choices=["modal-vllm", "openai"],
+        default=provider_default,
+        help="LLM provider. Both providers use the OpenAI Python client.",
+    )
+    parser.add_argument(
         "--endpoint",
         default=os.environ.get("DEFAULT_ENDPOINT"),
-        help="Base URL for the deployed OpenAI-compatible endpoint.",
+        help="Base URL for modal-vllm. Ignored when --provider openai.",
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("DEFAULT_MODEL", "llm"),
-        help="Served model name. modal_vllm exposes this as 'llm' by default.",
+        default=None,
+        help=f"Model name. Current provider default: {model_default}.",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Override provider API key. Defaults to OPENAI_API_KEY or VLLM_API_KEY.",
     )
     parser.add_argument(
         "--dataset",
@@ -118,52 +129,60 @@ def extract_code(text: str) -> str:
     return s.strip() + "\n"
 
 
+def openai_base_url(endpoint: str) -> str:
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        return base
+    return f"{base}/v1"
+
+
 def generate_text(
+    provider: str,
     endpoint: str,
+    api_key: str,
     model: str,
     messages: list[dict],
     max_tokens: int,
     temperature: float,
     timeout: int,
 ) -> str:
-    if not endpoint:
+    if provider == "modal-vllm" and not endpoint:
         raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT or pass --endpoint.")
 
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        f"{endpoint.rstrip('/')}/v1/chat/completions",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    from openai import OpenAI
+
+    if provider == "modal-vllm":
+        client = OpenAI(
+            api_key=api_key,
+            base_url=openai_base_url(endpoint),
+            timeout=timeout,
+        )
+    elif provider == "openai":
+        client = OpenAI(api_key=api_key, timeout=timeout)
+    else:
+        raise ValueError(f"unknown provider {provider!r}")
+
+    resolved_model = resolve_model(provider, model)
+    completion = client.chat.completions.create(
+        model=resolved_model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
-
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response_body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"endpoint returned HTTP {exc.code}: {error_body}") from exc
-
-    data = json.loads(response_body)
-    message = data["choices"][0]["message"]
+    message = completion.choices[0].message
     return (
-        message.get("content")
-        or message.get("reasoning")
-        or message.get("reasoning_content")
+        message.content
+        or getattr(message, "reasoning", None)
+        or getattr(message, "reasoning_content", None)
         or ""
     )
 
 
 def generate_predictions(
     data_dir: Path,
+    provider: str,
     endpoint: str,
+    api_key: str,
     model: str,
     dataset: str,
     output_path: Path,
@@ -172,16 +191,20 @@ def generate_predictions(
     timeout: int,
     limit: int = 0,
 ) -> Path:
-    if not endpoint:
+    resolved_api_key = resolve_api_key(provider, api_key)
+    if provider == "modal-vllm" and not endpoint:
         raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT or pass --endpoint.")
+    if provider == "openai" and not resolved_api_key:
+        raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY or pass --api-key.")
 
     items = load_alpaca(data_dir, dataset)
     if limit:
         items = items[:limit]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    target = endpoint.rstrip("/") if provider == "modal-vllm" else "OpenAI API"
     print(
-        f"generating {len(items)} predictions sequentially with {endpoint.rstrip('/')}",
+        f"generating {len(items)} predictions sequentially with {provider} ({target})",
         flush=True,
     )
 
@@ -189,7 +212,9 @@ def generate_predictions(
         for index, item in enumerate(items, start=1):
             try:
                 raw = generate_text(
+                    provider=provider,
                     endpoint=endpoint,
+                    api_key=resolved_api_key,
                     model=model,
                     messages=build_messages(item),
                     max_tokens=max_tokens,
@@ -207,13 +232,35 @@ def generate_predictions(
     return output_path
 
 
+def resolve_api_key(provider: str, override: str | None) -> str:
+    if override is not None:
+        return override
+    if provider == "openai":
+        return os.environ.get("OPENAI_API_KEY", "")
+    if provider == "modal-vllm":
+        return os.environ.get("VLLM_API_KEY", "EMPTY")
+    raise ValueError(f"unknown provider {provider!r}")
+
+
+def resolve_model(provider: str, override: str | None) -> str:
+    if override:
+        return override
+    if provider == "openai":
+        return os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    if provider == "modal-vllm":
+        return os.environ.get("VLLM_MODEL", "llm")
+    raise ValueError(f"unknown provider {provider!r}")
+
+
 def main() -> None:
     if load_dotenv is not None:
         load_dotenv()
     args = parse_args()
     output_path = generate_predictions(
         data_dir=args.data_dir,
+        provider=args.provider,
         endpoint=args.endpoint,
+        api_key=args.api_key,
         model=args.model,
         dataset=args.dataset,
         output_path=args.output,
