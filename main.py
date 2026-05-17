@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
-import sys
+import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
-TRITONBENCH_REPO = "https://github.com/thunlp/TritonBench.git"
-DEFAULT_TRITONBENCH_DIR = Path("vendor/TritonBench")
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    load_dotenv = None
+
+
+DEFAULT_DATA_DIR = Path("data")
 
 PROMPT_HEADER = (
     "You are an expert in Triton programming, capable of writing Triton kernels "
@@ -25,13 +31,23 @@ PROMPT_HEADER = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate predictions.jsonl sequentially with llms_xgrammar."
+        description="Generate predictions.jsonl with an OpenAI-compatible LLM endpoint."
     )
     parser.add_argument(
-        "--tritonbench-dir",
+        "--data-dir",
         type=Path,
-        default=DEFAULT_TRITONBENCH_DIR,
-        help="Path to a TritonBench checkout. Cloned if missing.",
+        default=DEFAULT_DATA_DIR,
+        help="Directory containing TritonBench_T_<simp|comp>_alpac_v1.json.",
+    )
+    parser.add_argument(
+        "--endpoint",
+        default=os.environ.get("DEFAULT_ENDPOINT"),
+        help="Base URL for the deployed OpenAI-compatible endpoint.",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("DEFAULT_MODEL", "llm"),
+        help="Served model name. modal_vllm exposes this as 'llm' by default.",
     )
     parser.add_argument(
         "--dataset",
@@ -52,72 +68,30 @@ def parse_args() -> argparse.Namespace:
         help="Output predictions.jsonl path.",
     )
     parser.add_argument(
-        "--model-name",
-        default="Qwen/Qwen2.5-0.5B-Instruct",
-        help="Hugging Face model id or local model path.",
-    )
-    parser.add_argument(
-        "--grammar-name",
-        default="triton_lexical",
-        help="llms_xgrammar grammar key.",
-    )
-    parser.add_argument(
-        "--device",
-        choices=["auto", "cpu", "cuda"],
-        default="auto",
-        help="Generation device.",
-    )
-    parser.add_argument(
-        "--max-new-tokens",
+        "--max-tokens",
         type=int,
         default=512,
         help="Maximum generated tokens per benchmark item.",
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.2,
+        help="Sampling temperature for the endpoint.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        help="HTTP timeout in seconds per request.",
+    )
     return parser.parse_args()
 
 
-def add_sibling_llms_xgrammar_to_path() -> None:
-    repo_root = Path(__file__).resolve().parent
-    workspace_root = repo_root.parent
-    candidates = [
-        workspace_root / "llms-xgrammar",
-        workspace_root / "llms_xgrammar",
-    ]
-    for candidate in candidates:
-        if (candidate / "llms_xgrammar" / "__init__.py").exists():
-            sys.path.insert(0, str(candidate))
-            return
-
-
-def load_generate_text():
-    add_sibling_llms_xgrammar_to_path()
-    try:
-        from llms_xgrammar import generate_text
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Could not import llms_xgrammar. Clone "
-            "https://github.com/Pablo389/llms-xgrammar next to this repo, or "
-            "install it in the current Python environment."
-        ) from exc
-    return generate_text
-
-
-def ensure_tritonbench_repo(repo_dir: Path) -> Path:
-    if repo_dir.exists():
-        print(f"using TritonBench checkout at {repo_dir}", flush=True)
-        return repo_dir
-
-    repo_dir.parent.mkdir(parents=True, exist_ok=True)
-    print(f"cloning TritonBench into {repo_dir}", flush=True)
-    subprocess.run(
-        ["git", "clone", "--depth", "1", TRITONBENCH_REPO, str(repo_dir)],
-        check=True,
-    )
-    return repo_dir
-
-
-def load_alpaca(tritonbench_dir: Path, dataset: str) -> list[dict]:
-    path = tritonbench_dir / f"data/TritonBench_T_{dataset}_alpac_v1.json"
+def load_alpaca(data_dir: Path, dataset: str) -> list[dict]:
+    path = data_dir / f"TritonBench_T_{dataset}_alpac_v1.json"
+    if not path.exists():
+        raise FileNotFoundError(f"dataset file not found: {path}")
     return json.loads(path.read_text())
 
 
@@ -144,24 +118,70 @@ def extract_code(text: str) -> str:
     return s.strip() + "\n"
 
 
+def generate_text(
+    endpoint: str,
+    model: str,
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
+) -> str:
+    if not endpoint:
+        raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT or pass --endpoint.")
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{endpoint.rstrip('/')}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"endpoint returned HTTP {exc.code}: {error_body}") from exc
+
+    data = json.loads(response_body)
+    message = data["choices"][0]["message"]
+    return (
+        message.get("content")
+        or message.get("reasoning")
+        or message.get("reasoning_content")
+        or ""
+    )
+
+
 def generate_predictions(
-    tritonbench_dir: Path,
+    data_dir: Path,
+    endpoint: str,
+    model: str,
     dataset: str,
     output_path: Path,
-    model_name: str,
-    grammar_name: str,
-    device: str,
-    max_new_tokens: int,
+    max_tokens: int,
+    temperature: float,
+    timeout: int,
     limit: int = 0,
 ) -> Path:
-    generate_text = load_generate_text()
-    items = load_alpaca(tritonbench_dir, dataset)
+    if not endpoint:
+        raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT or pass --endpoint.")
+
+    items = load_alpaca(data_dir, dataset)
     if limit:
         items = items[:limit]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(
-        f"generating {len(items)} predictions sequentially with llms_xgrammar/{model_name}",
+        f"generating {len(items)} predictions sequentially with {endpoint.rstrip('/')}",
         flush=True,
     )
 
@@ -169,11 +189,12 @@ def generate_predictions(
         for index, item in enumerate(items, start=1):
             try:
                 raw = generate_text(
+                    endpoint=endpoint,
+                    model=model,
                     messages=build_messages(item),
-                    model_name=model_name,
-                    grammar_name=grammar_name,
-                    max_new_tokens=max_new_tokens,
-                    device=device,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    timeout=timeout,
                 )
                 code = extract_code(raw)
             except Exception as exc:  # noqa: BLE001
@@ -187,16 +208,18 @@ def generate_predictions(
 
 
 def main() -> None:
+    if load_dotenv is not None:
+        load_dotenv()
     args = parse_args()
-    tritonbench_dir = ensure_tritonbench_repo(args.tritonbench_dir)
     output_path = generate_predictions(
-        tritonbench_dir=tritonbench_dir,
+        data_dir=args.data_dir,
+        endpoint=args.endpoint,
+        model=args.model,
         dataset=args.dataset,
         output_path=args.output,
-        model_name=args.model_name,
-        grammar_name=args.grammar_name,
-        device=args.device,
-        max_new_tokens=args.max_new_tokens,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        timeout=args.timeout,
         limit=args.limit,
     )
     print(f"wrote {output_path}")
