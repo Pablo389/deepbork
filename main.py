@@ -5,6 +5,13 @@ import json
 import os
 from pathlib import Path
 
+from tritonbench_helpers import (
+    DEFAULT_METADATA_FILE,
+    load_metadata,
+    parse_ops,
+    select_items_by_ops,
+)
+
 
 try:
     from dotenv import load_dotenv
@@ -69,8 +76,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=0,
-        help="Only generate the first N items. Use 0 for all items.",
+        default=None,
+        help="Only generate the first N items. Use 0 for all items. Defaults to 3.",
+    )
+    parser.add_argument(
+        "--ops",
+        default="",
+        help=(
+            "Comma-separated TritonBench-T operator filenames without the .py "
+            "extension, e.g. tanh,sqrt,fused_bmm_rmsnorm_gelu_dropout_sub."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -189,7 +204,8 @@ def generate_predictions(
     max_tokens: int,
     temperature: float,
     timeout: int,
-    limit: int = 0,
+    limit: int | None = None,
+    ops: str = "",
 ) -> Path:
     resolved_api_key = resolve_api_key(provider, api_key)
     if provider == "modal-vllm" and not endpoint:
@@ -197,8 +213,27 @@ def generate_predictions(
     if provider == "openai" and not resolved_api_key:
         raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY or pass --api-key.")
 
+    metadata_path = data_dir / DEFAULT_METADATA_FILE
+    requested_files = parse_ops(ops)
     items = load_alpaca(data_dir, dataset)
-    if limit:
+
+    if requested_files and limit is not None:
+        print(
+            "warning: both --limit and --ops were provided; ignoring --ops and using --limit",
+            flush=True,
+        )
+        requested_files = []
+
+    if requested_files:
+        metadata = load_metadata(metadata_path)
+        items = select_items_by_ops(items, metadata, requested_files)
+        print(
+            "selected ops: " + ", ".join(file_name.removesuffix(".py") for file_name in requested_files),
+            flush=True,
+        )
+    elif limit is None:
+        items = items[:3]
+    elif limit:
         items = items[:limit]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -268,6 +303,7 @@ def main() -> None:
         temperature=args.temperature,
         timeout=args.timeout,
         limit=args.limit,
+        ops=args.ops,
     )
     print(f"wrote {output_path}")
 

@@ -66,9 +66,42 @@ This repo expects the Alpaca prompt files to exist locally:
 data/
   TritonBench_T_simp_alpac_v1.json
   TritonBench_T_comp_alpac_v1.json
+  TritonBench_T_v1.jsonl
 ```
 
 No full TritonBench clone is needed for generation.
+
+## TritonBench-T File Roles
+
+The source of truth for these benchmark assets is the upstream
+[thunlp/TritonBench](https://github.com/thunlp/TritonBench) repo. This project
+uses the TritonBench-T track: PyTorch-to-Triton translation. Inputs describe
+PyTorch-style operators and ask the model to generate Triton wrapper functions.
+
+Relevant files in the benchmark flow:
+
+```text
+Input prompts:
+  TritonBench_T_simp_alpac_v1.json
+  TritonBench_T_comp_alpac_v1.json
+
+Metadata/index:
+  TritonBench_T_v1.jsonl
+
+Golden test/reference files:
+  TritonBench_T_v1/tanh.py
+  TritonBench_T_v1/fused_bmm_rmsnorm_gelu_dropout_sub.py
+  ...
+
+Generated output:
+  predictions.jsonl
+```
+
+`deepbork` uses the Alpaca prompt files for code generation. The TritonBench
+evaluator uses the `instruction` field in `predictions.jsonl` to recover the
+matching metadata row from `TritonBench_T_v1.jsonl`, then appends tests from the
+corresponding golden file in `TritonBench_T_v1/` to the generated `predict`
+code.
 
 ## Setup
 
@@ -98,6 +131,26 @@ Smoke test one item with `modal_vllm`:
 ```bash
 python3 main.py --provider modal-vllm --limit 1
 ```
+
+Generate a specific operator by TritonBench-T filename stem:
+
+```bash
+python3 main.py --provider openai --ops tanh
+```
+
+Multiple operators can be passed as a comma-separated list, without the `.py`
+extension:
+
+```bash
+python3 main.py --provider openai --ops tanh,sqrt,fused_bmm_rmsnorm_gelu_dropout_sub
+```
+
+`--ops` uses `data/TritonBench_T_v1.jsonl` as the metadata index. It matches the
+requested filename stem to the metadata `file` field, then matches that row's
+description to the Alpaca prompt's `Functional Description`. If no `--limit` or
+`--ops` is provided, `deepbork` generates the first 3 prompt rows by default. If
+both `--limit` and `--ops` are provided, `--limit` wins and `--ops` is ignored.
+Use `--limit 0` to generate all prompt rows.
 
 Pass the `modal_vllm` endpoint explicitly:
 
