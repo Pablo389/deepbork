@@ -65,6 +65,40 @@ def extract_functional_description(instruction: str) -> str:
     return " ".join(match.group(1).split())
 
 
+def normalize_description(description: str) -> str:
+    return " ".join(description.split())
+
+
+def metadata_by_description(metadata: list[dict]) -> dict[str, dict]:
+    return {
+        normalize_description(record.get("description", "")): record
+        for record in metadata
+        if record.get("description")
+    }
+
+
+def prediction_files(predictions_path: Path, metadata: list[dict]) -> list[str]:
+    records_by_description = metadata_by_description(metadata)
+    files = []
+    for line_no, line in enumerate(predictions_path.read_text().splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        try:
+            description = extract_functional_description(record.get("instruction", ""))
+        except ValueError:
+            files.append(f"<unmatched line {line_no}>")
+            continue
+
+        match = records_by_description.get(description)
+        if match and match.get("file"):
+            files.append(match["file"])
+        else:
+            files.append(f"<unmatched line {line_no}>")
+    return files
+
+
 def select_items_by_ops(
     items: list[dict],
     metadata: list[dict],
@@ -86,7 +120,7 @@ def select_items_by_ops(
 
     selected = []
     for file_name in requested_files:
-        description = " ".join(metadata_by_file[file_name]["description"].split())
+        description = normalize_description(metadata_by_file[file_name]["description"])
         matches = items_by_description.get(description, [])
         if not matches:
             raise ValueError(

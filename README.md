@@ -1,10 +1,10 @@
 # deepbork
 
-Local prediction-generation orchestrator for Deepbork.
+Local prediction-generation and Phase 1 evaluation orchestrator for Deepbork.
 
-This repo only creates a `predictions.jsonl` file. It does not run local model
-inference, build a Modal image, execute TritonBench evaluation, or upload
-artifacts anywhere.
+This repo creates a `predictions.jsonl` file and can run TritonBench-T Phase 1
+on Modal. It does not run local model inference or execute the full
+TritonBench pipeline.
 
 The current flow is:
 
@@ -13,6 +13,8 @@ The current flow is:
 3. call either a deployed `modal_vllm` endpoint or the real OpenAI API with the official `openai` client
 4. clean the returned code block
 5. write one JSON line per generated operator
+6. optionally upload that JSONL to Modal and run only
+   `0_call_acc.py::call_4file`
 
 ## Contract
 
@@ -56,7 +58,7 @@ cleanup logic used by the benchmark harness and writes JSONL records:
 {"instruction": "...", "predict": "..."}
 ```
 
-The resulting file is the only artifact this repo is responsible for.
+The generated JSONL file is also the input contract for Phase 1 evaluation.
 
 ## Dataset Files
 
@@ -70,6 +72,13 @@ data/
 ```
 
 No full TritonBench clone is needed for generation.
+
+Phase 1 evaluation uses `modal_phase1_app.py`, which clones the upstream
+TritonBench repo inside the Modal image and patches only the call-accuracy
+script paths needed for unattended execution. The app also includes
+`tritonbench_helpers.py` in the remote container with Modal's local Python
+source packaging so Phase 1 reporting reuses the same metadata matching logic
+as `--ops`.
 
 ## TritonBench-T File Roles
 
@@ -188,6 +197,71 @@ python3 main.py --provider modal-vllm --dataset comp --limit 1
 
 The generated file is written to `outputs/predictions.jsonl` by default.
 
+## Run Phase 1 on Modal
+
+Install dependencies and authenticate Modal once:
+
+```bash
+python3 -m pip install -r requirements.txt
+modal setup
+```
+
+Generate predictions locally, then run the Phase 1 call-accuracy evaluator on
+Modal:
+
+```bash
+python3 main.py --provider modal-vllm --limit 1 --output outputs/predictions.jsonl
+
+python3 phase1.py \
+  --predictions outputs/predictions.jsonl \
+  --output-subdir results/phase1
+```
+
+`phase1.py` is a thin batch wrapper around:
+
+```bash
+modal run modal_phase1_app.py::evaluate_phase1_only \
+  --predictions outputs/predictions.jsonl
+```
+
+The Modal app uploads the local JSONL into the `deepbork-phase1-data` volume,
+runs `0_call_acc.py::call_4file` on a single GPU, and prints a JSON summary:
+
+```json
+{
+  "total_predictions": 1,
+  "phase1_call_acc": {"passed": 0, "failed": 1, "rate": 0.0},
+  "attempted_files": ["tanh.py"],
+  "passed_files": [],
+  "failed_files": ["tanh.py"],
+  "artifacts_volume": "deepbork-phase1-data",
+  "artifacts_subdir": "results/phase1",
+  "call_acc_dir": "results/phase1/call_acc"
+}
+```
+
+Operators that pass Phase 1 are written as `.py` files under
+`results/phase1/call_acc/` in the Modal Volume. Phase 1 stdout and stderr are
+also written under `results/phase1/logs/`. Download them with:
+
+```bash
+modal volume get deepbork-phase1-data results/phase1 ./local-phase1-results/
+```
+
+Runtime knobs:
+
+```bash
+DEEPBORK_PHASE1_GPU=A10 modal run modal_phase1_app.py::evaluate_phase1_only \
+  --predictions outputs/predictions.jsonl
+
+DEEPBORK_MODAL_VOLUME=my-volume modal run modal_phase1_app.py::evaluate_phase1_only \
+  --predictions outputs/predictions.jsonl
+```
+
+This Phase 1-only surface is the intended batch hook for the later agentic loop:
+write one or more candidate predictions, call `evaluate_phase1`, inspect
+`passed_files` and `failed_files`, then decide whether to repair or accept.
+
 ## Scope
 
 In scope:
@@ -196,12 +270,13 @@ In scope:
 - build prompt messages
 - call either `modal_vllm` or OpenAI through the `openai` client
 - write `predictions.jsonl`
+- upload a local `predictions.jsonl` to Modal
+- run TritonBench-T Phase 1 only
+- return attempted, passed, and failed operator filenames
 
 Out of scope:
 
 - local Hugging Face inference
 - XGrammar runtime execution
-- Modal image build
-- TritonBench eval script patching
-- benchmark execution
-- uploading predictions
+- full TritonBench Phase 2 execution accuracy
+- full TritonBench Phase 3 performance benchmarking
