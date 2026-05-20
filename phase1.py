@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -43,6 +44,7 @@ def run_phase1(
     output_subdir: str,
     modal_app: Path = DEFAULT_MODAL_APP,
     modal_bin: str = "modal",
+    capture_output: bool = False,
 ) -> subprocess.CompletedProcess:
     if not predictions.exists():
         raise FileNotFoundError(f"predictions file not found: {predictions}")
@@ -58,7 +60,52 @@ def run_phase1(
         "--output-subdir",
         output_subdir,
     ]
-    return subprocess.run(command, check=True)
+    return subprocess.run(
+        command,
+        check=True,
+        capture_output=capture_output,
+        text=capture_output,
+    )
+
+
+def extract_phase1_summary(output: str) -> dict:
+    decoder = json.JSONDecoder()
+    summary = None
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "phase1_call_acc" in value:
+            summary = value
+    if summary is None:
+        raise ValueError("could not find Phase 1 JSON summary in Modal output")
+    return summary
+
+
+def evaluate_phase1_local(
+    predictions: Path,
+    output_subdir: str,
+    modal_app: Path = DEFAULT_MODAL_APP,
+    modal_bin: str = "modal",
+) -> dict:
+    try:
+        result = run_phase1(
+            predictions=predictions,
+            output_subdir=output_subdir,
+            modal_app=modal_app,
+            modal_bin=modal_bin,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            sys.stdout.write(exc.stdout)
+        if exc.stderr:
+            sys.stderr.write(exc.stderr)
+        raise
+    return extract_phase1_summary((result.stdout or "") + "\n" + (result.stderr or ""))
 
 
 def main() -> None:

@@ -13,12 +13,11 @@ Usage:
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import shutil
+import subprocess
 import sys
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import modal
@@ -71,18 +70,33 @@ app = modal.App(APP_NAME, image=image)
 data_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 
-class _Tee:
-    def __init__(self, *streams):
-        self._streams = streams
-
-    def write(self, data: str) -> int:
-        for stream in self._streams:
-            stream.write(data)
-        return len(data)
-
-    def flush(self) -> None:
-        for stream in self._streams:
-            stream.flush()
+def _run_call_acc(predictions_path: Path, call_acc_dir: Path, eval_dir: str) -> tuple[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = eval_dir + os.pathsep + env.get("PYTHONPATH", "")
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import call_acc, sys; "
+            "call_acc.call_4file(sys.argv[1], sys.argv[2], gpus=[0])"
+        ),
+        str(predictions_path),
+        str(call_acc_dir),
+    ]
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    sys.stdout.write(proc.stdout)
+    sys.stdout.flush()
+    sys.stderr.write(proc.stderr)
+    sys.stderr.flush()
+    if proc.returncode:
+        raise RuntimeError(f"Phase 1 call_acc failed with exit code {proc.returncode}")
+    return proc.stdout, proc.stderr
 
 
 def _upload_local_predictions(local_path: Path) -> str:
@@ -124,21 +138,12 @@ def evaluate_phase1(
         sys.path.insert(0, eval_dir)
     os.environ["PYTHONPATH"] = eval_dir + os.pathsep + os.environ.get("PYTHONPATH", "")
 
-    import call_acc  # noqa: E402
-
     metadata = load_metadata(Path(REPO_DIR) / "data" / DEFAULT_METADATA_FILE)
     attempted = prediction_files(pred_full, metadata)
     total = len(attempted)
 
     print("\n" + "=" * 70 + "\n=== Phase 1: call accuracy ===\n" + "=" * 70, flush=True)
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
-    with redirect_stdout(_Tee(sys.stdout, stdout_buffer)):
-        with redirect_stderr(_Tee(sys.stderr, stderr_buffer)):
-            call_acc.call_4file(str(pred_full), str(call_acc_dir), gpus=[0])
-
-    stdout_text = stdout_buffer.getvalue()
-    stderr_text = stderr_buffer.getvalue()
+    stdout_text, stderr_text = _run_call_acc(pred_full, call_acc_dir, eval_dir)
     (logs_dir / "phase1_stdout.txt").write_text(stdout_text)
     (logs_dir / "phase1_stderr.txt").write_text(stderr_text)
 

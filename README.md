@@ -262,6 +262,45 @@ This Phase 1-only surface is the intended batch hook for the later agentic loop:
 write one or more candidate predictions, call `evaluate_phase1`, inspect
 `passed_files` and `failed_files`, then decide whether to repair or accept.
 
+## Agentic Phase 1 MVP
+
+Run a simple one-operator repair loop:
+
+```bash
+python3 agentic_phase1.py \
+  --provider modal-vllm \
+  --ops div \
+  --max-attempts 5
+```
+
+The loop:
+
+- selects one benchmark item via the same `--ops` metadata matching used by
+  `main.py`
+- generates an initial prediction with the normal prompt
+- writes one local `predictions.jsonl` per attempt
+- runs Modal Phase 1
+- if Phase 1 fails, asks the model to repair the previous code using
+  `stdout_tail` and `stderr_tail`
+
+Local attempt artifacts are written under:
+
+```text
+outputs/agentic_phase1/<op>/
+├── attempt_001/
+│   ├── predictions.jsonl
+│   ├── predict.py
+│   ├── phase1_summary.json
+│   └── repair_prompt.json  # present when a repair attempt is needed
+└── result.json
+```
+
+Remote Modal artifacts use unique per-attempt directories:
+
+```text
+results/phase1/agentic/<op>/attempt_001/
+```
+
 ## Scope
 
 In scope:
