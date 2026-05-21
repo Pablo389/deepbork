@@ -181,7 +181,7 @@ def generate_text(
     completion = client.chat.completions.create(
         model=resolved_model,
         messages=messages,
-        max_tokens=max_tokens,
+        max_completion_tokens=max_tokens,
         temperature=temperature,
     )
     message = completion.choices[0].message

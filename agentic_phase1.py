@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 from main import (
@@ -29,6 +30,9 @@ except ModuleNotFoundError:
     load_dotenv = None
 
 
+DEFAULT_REPAIR_RULES = Path("repair_rules/triton_phase1_rules.json")
+
+
 REPAIR_SYSTEM_PROMPT = """You are repairing a generated Triton Python module.
 
 The previous generated code failed Phase 1 of TritonBench-T.
@@ -38,6 +42,7 @@ Phase 1 concatenates the generated Python module with the golden TritonBench-T t
 Your task:
 - Return a complete corrected Python module.
 - Preserve the wrapper function name and signature required by the instruction.
+- You may rewrite the implementation substantially if the previous structure is invalid.
 - Fix the runtime, import, syntax, Triton compilation, or CUDA error shown below.
 - If the error is caused by an unsupported Triton language function, replace it with Triton-supported operations.
 - Do not include markdown.
@@ -120,6 +125,12 @@ def parse_args() -> argparse.Namespace:
         help="Modal executable to invoke.",
     )
     parser.add_argument(
+        "--repair-rules",
+        type=Path,
+        default=DEFAULT_REPAIR_RULES,
+        help="JSON file containing curated Triton Phase 1 repair rules.",
+    )
+    parser.add_argument(
         "--max-tokens",
         type=int,
         default=1024,
@@ -163,12 +174,23 @@ def build_repair_messages(
     phase1_result: dict,
     attempt: int,
     max_attempts: int,
+    repair_rules: list[dict],
 ) -> list[dict]:
+    rules = format_repair_rules(
+        match_repair_rules(
+            previous_predict=previous_predict,
+            phase1_result=phase1_result,
+            repair_rules=repair_rules,
+        )
+    )
     user = f"""Original benchmark instruction:
 {benchmark_text(item)}
 
 Previous generated code:
 {previous_predict}
+
+Relevant repair rules:
+{rules}
 
 Phase 1 stdout:
 {phase1_result.get("stdout_tail", "")}
@@ -183,6 +205,63 @@ Repair attempt:
         {"role": "system", "content": REPAIR_SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
+
+
+def load_repair_rules(path: Path) -> list[dict]:
+    if not path.exists():
+        raise FileNotFoundError(f"repair rules file not found: {path}")
+    data = json.loads(path.read_text())
+    if not isinstance(data, list):
+        raise ValueError(f"repair rules file must contain a JSON list: {path}")
+    return data
+
+
+def match_repair_rules(
+    previous_predict: str,
+    phase1_result: dict,
+    repair_rules: list[dict],
+) -> list[dict]:
+    phase1_output = (phase1_result.get("stdout_tail", "") or "") + "\n" + (
+        phase1_result.get("stderr_tail", "") or ""
+    )
+    sources = {
+        "previous_predict": previous_predict,
+        "phase1_output": phase1_output,
+    }
+    matched = []
+    for rule in repair_rules:
+        patterns = rule.get("match", [])
+        if any(rule_pattern_matches(pattern, sources) for pattern in patterns):
+            matched.append(rule)
+    return matched
+
+
+def rule_pattern_matches(pattern: dict, sources: dict[str, str]) -> bool:
+    source = sources.get(pattern.get("source", ""), "")
+    if "contains" in pattern:
+        return pattern["contains"] in source
+    if "regex" in pattern:
+        return re.search(pattern["regex"], source, flags=re.DOTALL) is not None
+    return False
+
+
+def format_repair_rules(rules: list[dict]) -> str:
+    if not rules:
+        return "- No curated rule matched. Use the traceback line number and error message to make the smallest valid Triton fix."
+
+    blocks = []
+    for rule in rules:
+        lines = [
+            f"- [{rule.get('id', 'unnamed_rule')}]",
+            f"  Problem: {rule.get('problem', '')}",
+            f"  Fix: {rule.get('fix', '')}",
+        ]
+        avoid = rule.get("avoid") or []
+        if avoid:
+            lines.append("  Avoid:")
+            lines.extend(f"  - {item}" for item in avoid)
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
 
 
 def generate_code(
@@ -237,6 +316,7 @@ def solve_item_phase1(args: argparse.Namespace) -> dict:
     api_key = resolve_api_key(args.provider, args.api_key)
     model = resolve_model(args.provider, args.model)
     validate_generation_config(args.provider, args.endpoint, api_key)
+    repair_rules = load_repair_rules(args.repair_rules)
 
     op_dir = args.output_dir / op_stem
     op_dir.mkdir(parents=True, exist_ok=True)
@@ -303,6 +383,7 @@ def solve_item_phase1(args: argparse.Namespace) -> dict:
             phase1_result=summary,
             attempt=attempt,
             max_attempts=args.max_attempts,
+            repair_rules=repair_rules,
         )
         (attempt_dir / "repair_prompt.json").write_text(json.dumps(repair_messages, indent=2) + "\n")
         print("repairing candidate from Phase 1 output", flush=True)

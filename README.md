@@ -282,6 +282,8 @@ The loop:
 - runs Modal Phase 1
 - if Phase 1 fails, asks the model to repair the previous code using
   `stdout_tail` and `stderr_tail`
+- injects matching curated repair rules from
+  `repair_rules/triton_phase1_rules.json`
 
 Local attempt artifacts are written under:
 
@@ -300,6 +302,18 @@ Remote Modal artifacts use unique per-attempt directories:
 ```text
 results/phase1/agentic/<op>/attempt_001/
 ```
+
+Curated repair rules are data, not code. Add new recurring Phase 1 failure
+patterns to:
+
+```text
+repair_rules/triton_phase1_rules.json
+```
+
+Each rule has match patterns over `previous_predict` and/or `phase1_output`,
+plus a problem description, fix, and avoid list. The agentic loop loads the file
+with `--repair-rules` and includes only the matching rules in the next repair
+prompt.
 
 ## Scope
 
