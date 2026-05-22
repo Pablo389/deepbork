@@ -15,7 +15,7 @@ from main import (
     resolve_api_key,
     resolve_model,
 )
-from phase1 import DEFAULT_MODAL_APP, evaluate_local
+from evaluate import DEFAULT_MODAL_APP, evaluate_local
 from tritonbench_helpers import (
     DEFAULT_METADATA_FILE,
     load_metadata,
@@ -112,11 +112,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs/agentic_phase1"),
+        default=Path("outputs/agentic_eval"),
         help="Local directory for attempt artifacts.",
     )
     parser.add_argument(
-        "--phase1-output-prefix",
+        "--eval-output-prefix",
         default="results/phase1/agentic",
         help="Modal volume prefix for per-attempt evaluation artifacts.",
     )
@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
 def select_single_item(data_dir: Path, dataset: str, ops: str) -> tuple[str, dict]:
     requested_files = parse_ops(ops)
     if len(requested_files) != 1:
-        raise ValueError("--ops must name exactly one operator for agentic Phase 1")
+        raise ValueError("--ops must name exactly one operator for agentic evaluation")
 
     metadata = load_metadata(data_dir / DEFAULT_METADATA_FILE)
     items = load_alpaca(data_dir, dataset)
@@ -338,7 +338,7 @@ def validate_generation_config(provider: str, endpoint: str, api_key: str) -> No
         raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY or pass --api-key.")
 
 
-def solve_item_phase1(args: argparse.Namespace) -> dict:
+def solve_item(args: argparse.Namespace) -> dict:
     op_file, item = select_single_item(args.data_dir, args.dataset, args.ops)
     op_stem = op_file.removesuffix(".py")
 
@@ -371,7 +371,7 @@ def solve_item_phase1(args: argparse.Namespace) -> dict:
         write_single_prediction(prediction_path, item["instruction"], predict)
         (attempt_dir / "predict.py").write_text(predict)
 
-        output_subdir = f"{args.phase1_output_prefix}/{op_stem}/attempt_{attempt:03d}"
+        output_subdir = f"{args.eval_output_prefix}/{op_stem}/attempt_{attempt:03d}"
         print(
             f"{args.target_phase} attempt {attempt}/{args.max_attempts}: {output_subdir}",
             flush=True,
@@ -453,7 +453,7 @@ def main() -> None:
     if load_dotenv is not None:
         load_dotenv()
     args = parse_args()
-    result = solve_item_phase1(args)
+    result = solve_item(args)
     print(f"\n=== Agentic {args.target_phase} result ===")
     print(json.dumps(result, indent=2))
 

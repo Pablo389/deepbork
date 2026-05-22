@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_MODAL_APP = Path(__file__).with_name("modal_phase1_app.py")
+DEFAULT_MODAL_APP = Path(__file__).with_name("modal_eval_app.py")
 
 
 def parse_args() -> argparse.Namespace:

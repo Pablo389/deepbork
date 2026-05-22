@@ -212,12 +212,12 @@ Modal:
 ```bash
 python3 main.py --provider modal-vllm --limit 1 --output outputs/predictions.jsonl
 
-python3 phase1.py \
+python3 evaluate.py \
   --predictions outputs/predictions.jsonl \
   --output-subdir results/phase1
 ```
 
-`phase1.py` is a thin batch wrapper around:
+`evaluate.py` is a thin batch wrapper around:
 
 ```bash
 modal run modal_eval_app.py::evaluate_phase1_only \
@@ -228,7 +228,7 @@ To run Phase 1 followed by Phase 2 execution accuracy from a local
 `predictions.jsonl`:
 
 ```bash
-python3 phase1.py \
+python3 evaluate.py \
   --predictions outputs/predictions.jsonl \
   --target-phase all \
   --output-subdir results/phase1_phase2
@@ -238,7 +238,7 @@ To run Phase 2 later from an existing Phase 1 `call_acc` folder in the Modal
 Volume:
 
 ```bash
-python3 phase1.py \
+python3 evaluate.py \
   --target-phase phase2 \
   --call-acc-subdir results/phase1/call_acc \
   --output-subdir results/phase2
@@ -293,7 +293,7 @@ phase-specific passed/failed files, then decide whether to repair or accept.
 Run a simple one-operator repair loop:
 
 ```bash
-python3 agentic_phase1.py \
+python3 agentic_eval.py \
   --provider modal-vllm \
   --ops div \
   --max-attempts 5
@@ -302,7 +302,7 @@ python3 agentic_phase1.py \
 Require Phase 1 and Phase 2 to pass:
 
 ```bash
-python3 agentic_phase1.py \
+python3 agentic_eval.py \
   --provider modal-vllm \
   --ops div \
   --target-phase phase2 \
@@ -324,7 +324,7 @@ The loop:
 Local attempt artifacts are written under:
 
 ```text
-outputs/agentic_phase1/<op>/
+outputs/agentic_eval/<op>/
 ├── attempt_001/
 │   ├── predictions.jsonl
 │   ├── predict.py
