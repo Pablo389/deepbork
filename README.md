@@ -73,9 +73,9 @@ data/
 
 No full TritonBench clone is needed for generation.
 
-Phase 1 evaluation uses `modal_phase1_app.py`, which clones the upstream
-TritonBench repo inside the Modal image and patches only the call-accuracy
-script paths needed for unattended execution. The app also includes
+Evaluation uses `modal_eval_app.py`, which clones the upstream TritonBench repo
+inside the Modal image and patches the Phase 1 and Phase 2 script paths needed
+for unattended execution. The app also includes
 `tritonbench_helpers.py` in the remote container with Modal's local Python
 source packaging so Phase 1 reporting reuses the same metadata matching logic
 as `--ops`.
@@ -197,7 +197,7 @@ python3 main.py --provider modal-vllm --dataset comp --limit 1
 
 The generated file is written to `outputs/predictions.jsonl` by default.
 
-## Run Phase 1 on Modal
+## Run Evaluation on Modal
 
 Install dependencies and authenticate Modal once:
 
@@ -220,20 +220,46 @@ python3 phase1.py \
 `phase1.py` is a thin batch wrapper around:
 
 ```bash
-modal run modal_phase1_app.py::evaluate_phase1_only \
+modal run modal_eval_app.py::evaluate_phase1_only \
   --predictions outputs/predictions.jsonl
 ```
 
+To run Phase 1 followed by Phase 2 execution accuracy from a local
+`predictions.jsonl`:
+
+```bash
+python3 phase1.py \
+  --predictions outputs/predictions.jsonl \
+  --target-phase all \
+  --output-subdir results/phase1_phase2
+```
+
+To run Phase 2 later from an existing Phase 1 `call_acc` folder in the Modal
+Volume:
+
+```bash
+python3 phase1.py \
+  --target-phase phase2 \
+  --call-acc-subdir results/phase1/call_acc \
+  --output-subdir results/phase2
+```
+
+This uses the same Modal image. Phase 2 consumes the `.py` files that survive
+Phase 1 in `call_acc/`, copies them into the Phase 2 output directory when run
+standalone, runs `1_exe_acc.py::execute_4folder`, and deletes files whose
+outputs differ from the golden implementation.
+
 The Modal app uploads the local JSONL into the `deepbork-phase1-data` volume,
-runs `0_call_acc.py::call_4file` on a single GPU, and prints a JSON summary:
+runs the requested phases on a single GPU, and prints a JSON summary:
 
 ```json
 {
   "total_predictions": 1,
   "phase1_call_acc": {"passed": 0, "failed": 1, "rate": 0.0},
   "attempted_files": ["tanh.py"],
-  "passed_files": [],
-  "failed_files": ["tanh.py"],
+  "failed_phase": "phase1",
+  "phase1_passed_files": [],
+  "phase1_failed_files": ["tanh.py"],
   "artifacts_volume": "deepbork-phase1-data",
   "artifacts_subdir": "results/phase1",
   "call_acc_dir": "results/phase1/call_acc"
@@ -251,18 +277,18 @@ modal volume get deepbork-phase1-data results/phase1 ./local-phase1-results/
 Runtime knobs:
 
 ```bash
-DEEPBORK_PHASE1_GPU=A10 modal run modal_phase1_app.py::evaluate_phase1_only \
+DEEPBORK_PHASE1_GPU=A10 modal run modal_eval_app.py::evaluate_phase1_only \
   --predictions outputs/predictions.jsonl
 
-DEEPBORK_MODAL_VOLUME=my-volume modal run modal_phase1_app.py::evaluate_phase1_only \
+DEEPBORK_MODAL_VOLUME=my-volume modal run modal_eval_app.py::evaluate_phase1_only \
   --predictions outputs/predictions.jsonl
 ```
 
-This Phase 1-only surface is the intended batch hook for the later agentic loop:
-write one or more candidate predictions, call `evaluate_phase1`, inspect
-`passed_files` and `failed_files`, then decide whether to repair or accept.
+This evaluation surface is the intended batch hook for the agentic loop: write
+one candidate prediction, call Modal evaluation, inspect `failed_phase` and the
+phase-specific passed/failed files, then decide whether to repair or accept.
 
-## Agentic Phase 1 MVP
+## Agentic Evaluation MVP
 
 Run a simple one-operator repair loop:
 
@@ -273,17 +299,27 @@ python3 agentic_phase1.py \
   --max-attempts 5
 ```
 
+Require Phase 1 and Phase 2 to pass:
+
+```bash
+python3 agentic_phase1.py \
+  --provider modal-vllm \
+  --ops div \
+  --target-phase phase2 \
+  --max-attempts 5
+```
+
 The loop:
 
 - selects one benchmark item via the same `--ops` metadata matching used by
   `main.py`
 - generates an initial prediction with the normal prompt
 - writes one local `predictions.jsonl` per attempt
-- runs Modal Phase 1
-- if Phase 1 fails, asks the model to repair the previous code using
+- runs Modal evaluation through the requested target phase
+- if evaluation fails, asks the model to repair the previous code using
   `stdout_tail` and `stderr_tail`
-- injects matching curated repair rules from
-  `repair_rules/triton_phase1_rules.json`
+- injects matching curated repair rules from the Phase 1 or Phase 2 rules file,
+  depending on `failed_phase`
 
 Local attempt artifacts are written under:
 
@@ -292,7 +328,8 @@ outputs/agentic_phase1/<op>/
 ├── attempt_001/
 │   ├── predictions.jsonl
 │   ├── predict.py
-│   ├── phase1_summary.json
+│   ├── evaluation_summary.json
+│   ├── phase1_summary.json  # compatibility copy
 │   └── repair_prompt.json  # present when a repair attempt is needed
 └── result.json
 ```
@@ -310,10 +347,17 @@ patterns to:
 repair_rules/triton_phase1_rules.json
 ```
 
-Each rule has match patterns over `previous_predict` and/or `phase1_output`,
-plus a problem description, fix, and avoid list. The agentic loop loads the file
-with `--repair-rules` and includes only the matching rules in the next repair
-prompt.
+Add Phase 2 semantic mismatch rules to:
+
+```text
+repair_rules/triton_phase2_rules.json
+```
+
+Each rule has match patterns over `previous_predict`, `phase1_output`,
+`phase2_output`, or `evaluation_output`, plus a problem description, fix, and
+avoid list. The agentic loop loads the files with `--repair-rules` and
+`--phase2-repair-rules`, then includes only the matching rules for the failed
+phase in the next repair prompt.
 
 ## Scope
 
@@ -324,12 +368,11 @@ In scope:
 - call either `modal_vllm` or OpenAI through the `openai` client
 - write `predictions.jsonl`
 - upload a local `predictions.jsonl` to Modal
-- run TritonBench-T Phase 1 only
+- run TritonBench-T Phase 1 and optionally Phase 2
 - return attempted, passed, and failed operator filenames
 
 Out of scope:
 
 - local Hugging Face inference
 - XGrammar runtime execution
-- full TritonBench Phase 2 execution accuracy
 - full TritonBench Phase 3 performance benchmarking

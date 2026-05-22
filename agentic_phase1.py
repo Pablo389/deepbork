@@ -15,7 +15,7 @@ from main import (
     resolve_api_key,
     resolve_model,
 )
-from phase1 import DEFAULT_MODAL_APP, evaluate_phase1_local
+from phase1 import DEFAULT_MODAL_APP, evaluate_local
 from tritonbench_helpers import (
     DEFAULT_METADATA_FILE,
     load_metadata,
@@ -30,14 +30,15 @@ except ModuleNotFoundError:
     load_dotenv = None
 
 
-DEFAULT_REPAIR_RULES = Path("repair_rules/triton_phase1_rules.json")
+DEFAULT_PHASE1_REPAIR_RULES = Path("repair_rules/triton_phase1_rules.json")
+DEFAULT_PHASE2_REPAIR_RULES = Path("repair_rules/triton_phase2_rules.json")
 
 
 REPAIR_SYSTEM_PROMPT = """You are repairing a generated Triton Python module.
 
-The previous generated code failed Phase 1 of TritonBench-T.
+The previous generated code failed TritonBench-T evaluation.
 
-Phase 1 concatenates the generated Python module with the golden TritonBench-T test driver and executes the resulting file.
+Phase 1 concatenates the generated Python module with the golden TritonBench-T test driver and executes the resulting file. Phase 2 re-runs surviving Phase 1 modules and compares their outputs with the golden implementation.
 
 Your task:
 - Return a complete corrected Python module.
@@ -56,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     provider_default = os.environ.get("LLM_PROVIDER", "modal-vllm")
     model_default = resolve_model(provider_default, None)
     parser = argparse.ArgumentParser(
-        description="Run a simple local generate/repair loop against Modal Phase 1."
+        description="Run a simple local generate/repair loop against Modal evaluation."
     )
     parser.add_argument(
         "--data-dir",
@@ -100,7 +101,13 @@ def parse_args() -> argparse.Namespace:
         "--max-attempts",
         type=int,
         default=5,
-        help="Maximum total Phase 1 attempts, including the first generation.",
+        help="Maximum total evaluation attempts, including the first generation.",
+    )
+    parser.add_argument(
+        "--target-phase",
+        choices=["phase1", "phase2"],
+        default="phase1",
+        help="Stop after Phase 1, or require Phase 1 and Phase 2 to pass.",
     )
     parser.add_argument(
         "--output-dir",
@@ -111,13 +118,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phase1-output-prefix",
         default="results/phase1/agentic",
-        help="Modal volume prefix for per-attempt Phase 1 artifacts.",
+        help="Modal volume prefix for per-attempt evaluation artifacts.",
     )
     parser.add_argument(
         "--modal-app",
         type=Path,
         default=DEFAULT_MODAL_APP,
-        help="Path to the Modal Phase 1 app file.",
+        help="Path to the Modal evaluation app file.",
     )
     parser.add_argument(
         "--modal-bin",
@@ -127,8 +134,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--repair-rules",
         type=Path,
-        default=DEFAULT_REPAIR_RULES,
+        default=DEFAULT_PHASE1_REPAIR_RULES,
         help="JSON file containing curated Triton Phase 1 repair rules.",
+    )
+    parser.add_argument(
+        "--phase2-repair-rules",
+        type=Path,
+        default=DEFAULT_PHASE2_REPAIR_RULES,
+        help="JSON file containing curated Triton Phase 2 repair rules.",
     )
     parser.add_argument(
         "--max-tokens",
@@ -171,15 +184,16 @@ def benchmark_text(item: dict) -> str:
 def build_repair_messages(
     item: dict,
     previous_predict: str,
-    phase1_result: dict,
+    evaluation_result: dict,
     attempt: int,
     max_attempts: int,
     repair_rules: list[dict],
+    failed_phase: str,
 ) -> list[dict]:
     rules = format_repair_rules(
         match_repair_rules(
             previous_predict=previous_predict,
-            phase1_result=phase1_result,
+            evaluation_result=evaluation_result,
             repair_rules=repair_rules,
         )
     )
@@ -192,11 +206,14 @@ Previous generated code:
 Relevant repair rules:
 {rules}
 
-Phase 1 stdout:
-{phase1_result.get("stdout_tail", "")}
+Failed phase:
+{failed_phase}
 
-Phase 1 stderr:
-{phase1_result.get("stderr_tail", "")}
+Evaluation stdout:
+{evaluation_result.get("stdout_tail", "")}
+
+Evaluation stderr:
+{evaluation_result.get("stderr_tail", "")}
 
 Repair attempt:
 {attempt + 1} of {max_attempts}
@@ -218,15 +235,17 @@ def load_repair_rules(path: Path) -> list[dict]:
 
 def match_repair_rules(
     previous_predict: str,
-    phase1_result: dict,
+    evaluation_result: dict,
     repair_rules: list[dict],
 ) -> list[dict]:
-    phase1_output = (phase1_result.get("stdout_tail", "") or "") + "\n" + (
-        phase1_result.get("stderr_tail", "") or ""
+    evaluation_output = (evaluation_result.get("stdout_tail", "") or "") + "\n" + (
+        evaluation_result.get("stderr_tail", "") or ""
     )
     sources = {
         "previous_predict": previous_predict,
-        "phase1_output": phase1_output,
+        "phase1_output": evaluation_output,
+        "phase2_output": evaluation_output,
+        "evaluation_output": evaluation_output,
     }
     matched = []
     for rule in repair_rules:
@@ -298,8 +317,18 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def is_passed(summary: dict, op_file: str) -> bool:
-    return op_file in set(summary.get("passed_files", []))
+def is_passed(summary: dict, op_file: str, target_phase: str) -> bool:
+    if target_phase == "phase2":
+        return op_file in set(summary.get("phase2_passed_files", []))
+    return op_file in set(summary.get("phase1_passed_files", summary.get("passed_files", [])))
+
+
+def failed_phase(summary: dict, target_phase: str) -> str:
+    if summary.get("failed_phase"):
+        return summary["failed_phase"]
+    if target_phase == "phase2" and summary.get("phase2_exec_acc", {}).get("failed", 0):
+        return "phase2"
+    return "phase1"
 
 
 def validate_generation_config(provider: str, endpoint: str, api_key: str) -> None:
@@ -316,12 +345,13 @@ def solve_item_phase1(args: argparse.Namespace) -> dict:
     api_key = resolve_api_key(args.provider, args.api_key)
     model = resolve_model(args.provider, args.model)
     validate_generation_config(args.provider, args.endpoint, api_key)
-    repair_rules = load_repair_rules(args.repair_rules)
+    phase1_repair_rules = load_repair_rules(args.repair_rules)
+    phase2_repair_rules = load_repair_rules(args.phase2_repair_rules)
 
     op_dir = args.output_dir / op_stem
     op_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"agentic phase1 target: {op_file}", flush=True)
+    print(f"agentic {args.target_phase} target: {op_file}", flush=True)
     print(f"generating initial candidate with {args.provider}/{model}", flush=True)
     predict = generate_code(
         provider=args.provider,
@@ -342,30 +372,36 @@ def solve_item_phase1(args: argparse.Namespace) -> dict:
         (attempt_dir / "predict.py").write_text(predict)
 
         output_subdir = f"{args.phase1_output_prefix}/{op_stem}/attempt_{attempt:03d}"
-        print(f"phase1 attempt {attempt}/{args.max_attempts}: {output_subdir}", flush=True)
-        summary = evaluate_phase1_local(
+        print(
+            f"{args.target_phase} attempt {attempt}/{args.max_attempts}: {output_subdir}",
+            flush=True,
+        )
+        summary = evaluate_local(
             predictions=prediction_path,
             output_subdir=output_subdir,
             modal_app=args.modal_app,
             modal_bin=args.modal_bin,
+            target_phase="all" if args.target_phase == "phase2" else "phase1",
         )
         last_summary = summary
+        write_json(attempt_dir / "evaluation_summary.json", summary)
         write_json(attempt_dir / "phase1_summary.json", summary)
-        metrics = summary.get("phase1_call_acc", {})
+        metrics = summary.get("phase2_exec_acc" if args.target_phase == "phase2" else "phase1_call_acc", {})
         print(
-            "phase1 result: "
+            f"{args.target_phase} result: "
             f"{metrics.get('passed', 0)}/{summary.get('total_predictions', 0)} "
             f"passed ({metrics.get('rate', 0)}%)",
             flush=True,
         )
 
-        if is_passed(summary, op_file):
+        if is_passed(summary, op_file, args.target_phase):
             result = {
                 "passed": True,
+                "target_phase": args.target_phase,
                 "op_file": op_file,
                 "attempts": attempt,
                 "final_predict_path": str(attempt_dir / "predict.py"),
-                "last_phase1_result": summary,
+                "last_evaluation_result": summary,
             }
             write_json(op_dir / "result.json", result)
             return result
@@ -375,18 +411,21 @@ def solve_item_phase1(args: argparse.Namespace) -> dict:
 
         failure_tail = summary.get("stderr_tail") or summary.get("stdout_tail") or ""
         if failure_tail:
-            print("phase1 failure tail:\n" + failure_tail[-1200:], flush=True)
+            print("evaluation failure tail:\n" + failure_tail[-1200:], flush=True)
 
+        current_failed_phase = failed_phase(summary, args.target_phase)
+        current_repair_rules = phase2_repair_rules if current_failed_phase == "phase2" else phase1_repair_rules
         repair_messages = build_repair_messages(
             item=item,
             previous_predict=predict,
-            phase1_result=summary,
+            evaluation_result=summary,
             attempt=attempt,
             max_attempts=args.max_attempts,
-            repair_rules=repair_rules,
+            repair_rules=current_repair_rules,
+            failed_phase=current_failed_phase,
         )
         (attempt_dir / "repair_prompt.json").write_text(json.dumps(repair_messages, indent=2) + "\n")
-        print("repairing candidate from Phase 1 output", flush=True)
+        print(f"repairing candidate from {current_failed_phase} output", flush=True)
         predict = generate_code(
             provider=args.provider,
             endpoint=args.endpoint,
@@ -400,10 +439,11 @@ def solve_item_phase1(args: argparse.Namespace) -> dict:
 
     result = {
         "passed": False,
+        "target_phase": args.target_phase,
         "op_file": op_file,
         "attempts": args.max_attempts,
         "final_predict_path": str(op_dir / f"attempt_{args.max_attempts:03d}" / "predict.py"),
-        "last_phase1_result": last_summary,
+        "last_evaluation_result": last_summary,
     }
     write_json(op_dir / "result.json", result)
     return result
@@ -414,7 +454,7 @@ def main() -> None:
         load_dotenv()
     args = parse_args()
     result = solve_item_phase1(args)
-    print("\n=== Agentic Phase 1 result ===")
+    print(f"\n=== Agentic {args.target_phase} result ===")
     print(json.dumps(result, indent=2))
 
 

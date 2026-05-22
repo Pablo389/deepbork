@@ -1,0 +1,81 @@
+[
+  {
+    "id": "phase2_output_mismatch",
+    "match": [
+      {
+        "source": "phase2_output",
+        "contains": "Deleted"
+      },
+      {
+        "source": "phase2_output",
+        "contains": "Above is exe test"
+      }
+    ],
+    "problem": "The generated module passed Phase 1 but failed Phase 2 output comparison against the golden implementation.",
+    "fix": "Preserve the wrapper signature and repair semantic behavior: output shape, dtype, broadcasting, reduction dimension, out/inplace handling, and optional argument defaults must match the original instruction.",
+    "avoid": [
+      "Do not only fix syntax or compilation issues; Phase 2 failures are usually semantic mismatches.",
+      "Do not ignore optional arguments such as out, dim, training, inplace, stride, padding, dilation, or groups."
+    ]
+  },
+  {
+    "id": "shape_or_broadcast_mismatch",
+    "match": [
+      {
+        "source": "phase2_output",
+        "contains": "shape"
+      },
+      {
+        "source": "phase2_output",
+        "contains": "broadcast"
+      },
+      {
+        "source": "phase2_output",
+        "contains": "size"
+      }
+    ],
+    "problem": "The generated output likely has a shape, size, or broadcasting mismatch.",
+    "fix": "Re-read the wrapper entry information and PyTorch semantics. Allocate output tensors with the exact expected shape and use masks/broadcasting that match PyTorch behavior.",
+    "avoid": [
+      "Do not assume the output shape is always input.shape.",
+      "Do not ignore broadcasting rules for scalar or tensor arguments."
+    ]
+  },
+  {
+    "id": "out_argument_semantics",
+    "match": [
+      {
+        "source": "previous_predict",
+        "contains": "out is None"
+      },
+      {
+        "source": "phase2_output",
+        "contains": "out"
+      }
+    ],
+    "problem": "The generated wrapper may mishandle the optional out argument.",
+    "fix": "If out is provided, write results into it and return it. If out is None, allocate a correctly shaped output tensor.",
+    "avoid": [
+      "Do not allocate and return a new tensor when out is provided.",
+      "Do not ignore the keyword-only out argument."
+    ]
+  },
+  {
+    "id": "dimension_argument_semantics",
+    "match": [
+      {
+        "source": "previous_predict",
+        "contains": "dim"
+      },
+      {
+        "source": "phase2_output",
+        "contains": "dim"
+      }
+    ],
+    "problem": "The generated wrapper may apply an operation along the wrong dimension.",
+    "fix": "Honor the dim argument exactly as specified by the wrapper entry information, including defaults and negative dimensions if applicable.",
+    "avoid": [
+      "Do not hardcode reductions or softmax/logsoftmax to dim=0 unless the instruction requires it."
+    ]
+  }
+]
