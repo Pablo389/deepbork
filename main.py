@@ -20,6 +20,9 @@ except ModuleNotFoundError:
 
 
 DEFAULT_DATA_DIR = Path("data")
+DEFAULT_DATASET = "simp"
+DEFAULT_OUTPUT_PATH = Path("outputs/predictions.jsonl")
+DEFAULT_TIMEOUT = 600
 
 PROMPT_HEADER = (
     "You are an expert in Triton programming, capable of writing Triton kernels "
@@ -41,37 +44,15 @@ def parse_args() -> argparse.Namespace:
         description="Generate predictions.jsonl with an OpenAI-compatible LLM endpoint."
     )
     parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=DEFAULT_DATA_DIR,
-        help="Directory containing TritonBench_T_<simp|comp>_alpac_v1.json.",
-    )
-    parser.add_argument(
         "--provider",
         choices=["modal-vllm", "openai"],
         default=provider_default,
         help="LLM provider. Both providers use the OpenAI Python client.",
     )
     parser.add_argument(
-        "--endpoint",
-        default=os.environ.get("DEFAULT_ENDPOINT"),
-        help="Base URL for modal-vllm. Ignored when --provider openai.",
-    )
-    parser.add_argument(
         "--model",
         default=None,
         help=f"Model name. Current provider default: {model_default}.",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Override provider API key. Defaults to OPENAI_API_KEY or VLLM_API_KEY.",
-    )
-    parser.add_argument(
-        "--dataset",
-        choices=["simp", "comp"],
-        default="simp",
-        help="TritonBench Alpaca dataset variant.",
     )
     parser.add_argument(
         "--limit",
@@ -88,15 +69,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("outputs/predictions.jsonl"),
-        help="Output predictions.jsonl path.",
-    )
-    parser.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
+        default=8192,
         help="Maximum generated tokens per benchmark item.",
     )
     parser.add_argument(
@@ -108,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=600,
+        default=DEFAULT_TIMEOUT,
         help="HTTP timeout in seconds per request.",
     )
     return parser.parse_args()
@@ -162,7 +137,7 @@ def generate_text(
     timeout: int,
 ) -> str:
     if provider == "modal-vllm" and not endpoint:
-        raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT or pass --endpoint.")
+        raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT.")
 
     from openai import OpenAI
 
@@ -194,28 +169,24 @@ def generate_text(
 
 
 def generate_predictions(
-    data_dir: Path,
     provider: str,
-    endpoint: str,
-    api_key: str,
     model: str,
-    dataset: str,
-    output_path: Path,
     max_tokens: int,
     temperature: float,
     timeout: int,
     limit: int | None = None,
     ops: str = "",
 ) -> Path:
-    resolved_api_key = resolve_api_key(provider, api_key)
+    endpoint = resolve_endpoint(provider)
+    resolved_api_key = resolve_api_key(provider)
     if provider == "modal-vllm" and not endpoint:
-        raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT or pass --endpoint.")
+        raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT.")
     if provider == "openai" and not resolved_api_key:
-        raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY or pass --api-key.")
+        raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY.")
 
-    metadata_path = data_dir / DEFAULT_METADATA_FILE
+    metadata_path = DEFAULT_DATA_DIR / DEFAULT_METADATA_FILE
     requested_files = parse_ops(ops)
-    items = load_alpaca(data_dir, dataset)
+    items = load_alpaca(DEFAULT_DATA_DIR, DEFAULT_DATASET)
 
     if requested_files and limit is not None:
         print(
@@ -236,14 +207,14 @@ def generate_predictions(
     elif limit:
         items = items[:limit]
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     target = endpoint.rstrip("/") if provider == "modal-vllm" else "OpenAI API"
     print(
         f"generating {len(items)} predictions sequentially with {provider} ({target})",
         flush=True,
     )
 
-    with output_path.open("w") as f:
+    with DEFAULT_OUTPUT_PATH.open("w") as f:
         for index, item in enumerate(items, start=1):
             try:
                 raw = generate_text(
@@ -264,16 +235,24 @@ def generate_predictions(
             f.write(json.dumps(record) + "\n")
             print(f"  {index}/{len(items)}", flush=True)
 
-    return output_path
+    return DEFAULT_OUTPUT_PATH
 
 
-def resolve_api_key(provider: str, override: str | None) -> str:
+def resolve_api_key(provider: str, override: str | None = None) -> str:
     if override is not None:
         return override
     if provider == "openai":
         return os.environ.get("OPENAI_API_KEY", "")
     if provider == "modal-vllm":
         return os.environ.get("VLLM_API_KEY", "EMPTY")
+    raise ValueError(f"unknown provider {provider!r}")
+
+
+def resolve_endpoint(provider: str) -> str:
+    if provider == "modal-vllm":
+        return os.environ.get("DEFAULT_ENDPOINT", "")
+    if provider == "openai":
+        return ""
     raise ValueError(f"unknown provider {provider!r}")
 
 
@@ -292,13 +271,8 @@ def main() -> None:
         load_dotenv()
     args = parse_args()
     output_path = generate_predictions(
-        data_dir=args.data_dir,
         provider=args.provider,
-        endpoint=args.endpoint,
-        api_key=args.api_key,
         model=args.model,
-        dataset=args.dataset,
-        output_path=args.output,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         timeout=args.timeout,

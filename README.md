@@ -1,20 +1,72 @@
 # deepbork
 
-Local prediction-generation and Phase 1 evaluation orchestrator for Deepbork.
+Agentic TritonBench-T code generation and evaluation orchestrator for
+Deepbork.
 
-This repo creates a `predictions.jsonl` file and can run TritonBench-T Phase 1
-on Modal. It does not run local model inference or execute the full
-TritonBench pipeline.
+The repo is no longer aimed only at producing a `predictions.jsonl` file.
+`predictions.jsonl` is still the batch interchange format, but the main target
+is now the full local-to-Modal evaluation loop:
 
-The current flow is:
+1. generate Triton Python candidates from TritonBench-T prompts
+2. evaluate candidates on Modal using TritonBench-T Phase 1 and Phase 2
+3. persist local and remote artifacts per run or per agentic attempt
+4. repair failed candidates with evaluation feedback and curated rules
+5. keep each evaluation phase callable independently so future Phase 3 and
+   phase-specific agentic policies can be added without changing the whole
+   pipeline
 
-1. read the local TritonBench-T Alpaca dataset files from `data/`
-2. build OpenAI-style chat messages for each benchmark item
-3. call either a deployed `modal_vllm` endpoint or the real OpenAI API with the official `openai` client
-4. clean the returned code block
-5. write one JSON line per generated operator
-6. optionally upload that JSONL to Modal and run only
-   `0_call_acc.py::call_4file`
+The current implemented pipeline supports generation, Phase 1 call accuracy,
+Phase 2 execution accuracy, and a one-operator agentic repair loop. Phase 3
+performance benchmarking is the next planned evaluation stage.
+
+## Repository Flow
+
+The main files have separate responsibilities:
+
+```text
+main.py             batch code generation; writes outputs/predictions.jsonl
+evaluate.py         local CLI/Python launcher for Modal evaluation
+modal_eval_app.py   Modal image, volume, GPU execution, Phase 1/2 evaluators
+agentic_eval.py     generate/evaluate/repair loop for one operator
+tritonbench_helpers.py
+                    metadata matching between prompts, ops, and predictions
+repair_rules/       editable repair knowledge injected into repair prompts
+```
+
+Batch evaluation flow:
+
+```text
+main.py
+  -> outputs/predictions.jsonl
+  -> evaluate.py --mode phase1|phase2|all
+  -> modal_eval_app.py
+  -> Modal volume results/
+```
+
+Agentic flow:
+
+```text
+agentic_eval.py
+  -> generate one candidate using main.py prompt helpers
+  -> write outputs/agentic_eval/<op>/attempt_N/predictions.jsonl
+  -> evaluate through target stage on Modal
+  -> accept, or repair using stdout/stderr + repair_rules/
+```
+
+The agentic target is a stage threshold:
+
+```text
+--target-stage phase1  -> run Phase 1 only and accept Phase 1 survivors
+--target-stage phase2  -> run Phase 1 then Phase 2 and accept Phase 2 survivors
+```
+
+The standalone evaluator mode is a direct Modal command:
+
+```text
+--mode phase1  -> predictions.jsonl -> call_acc/
+--mode phase2  -> existing call_acc/ -> Phase 2 surviving call_acc/
+--mode all     -> predictions.jsonl -> Phase 1 -> Phase 2
+```
 
 ## Contract
 
@@ -58,7 +110,9 @@ cleanup logic used by the benchmark harness and writes JSONL records:
 {"instruction": "...", "predict": "..."}
 ```
 
-The generated JSONL file is also the input contract for Phase 1 evaluation.
+The generated JSONL file is the input contract for batch evaluation. Phase 1
+consumes it directly; Phase 2 can either run immediately after Phase 1
+(`--mode all`) or later from a Modal-volume `call_acc/` directory.
 
 ## Dataset Files
 
@@ -133,7 +187,28 @@ The endpoint should be the base URL from `modal_vllm`, without
 `/v1/chat/completions`. `deepbork` accepts either the base endpoint or the
 endpoint ending in `/v1`.
 
-## Generate Predictions
+## Main Commands
+
+For the current repo direction, the most important commands are:
+
+```bash
+# Agentic one-operator loop, accepting only Phase 1 survivors.
+python3 agentic_eval.py --provider modal-vllm --ops div
+
+# Agentic one-operator loop, accepting only candidates that pass Phase 1 and Phase 2.
+python3 agentic_eval.py --provider modal-vllm --ops div --target-stage phase2
+
+# Batch generation, still useful for offline or bulk evaluation.
+python3 main.py --provider modal-vllm --ops div
+
+# Batch evaluation through Phase 1 and Phase 2.
+python3 evaluate.py --mode all --predictions outputs/predictions.jsonl
+
+# Standalone Phase 2 from the default Phase 1 call_acc directory.
+python3 evaluate.py --mode phase2
+```
+
+## Batch Generation
 
 Smoke test one item with `modal_vllm`:
 
@@ -154,6 +229,10 @@ extension:
 python3 main.py --provider openai --ops tanh,sqrt,fused_bmm_rmsnorm_gelu_dropout_sub
 ```
 
+`main.py` reads from `data/`, uses the `simp` dataset by default, resolves the
+endpoint/API key from environment variables, and writes
+`outputs/predictions.jsonl`. These are repo defaults, not CLI options.
+
 `--ops` uses `data/TritonBench_T_v1.jsonl` as the metadata index. It matches the
 requested filename stem to the metadata `file` field, then matches that row's
 description to the Alpaca prompt's `Functional Description`. If no `--limit` or
@@ -161,19 +240,8 @@ description to the Alpaca prompt's `Functional Description`. If no `--limit` or
 both `--limit` and `--ops` are provided, `--limit` wins and `--ops` is ignored.
 Use `--limit 0` to generate all prompt rows.
 
-Pass the `modal_vllm` endpoint explicitly:
-
-```bash
-python3 main.py \
-  --provider modal-vllm \
-  --endpoint https://your-workspace--example-vllm-inference-serve.modal.run \
-  --model llm \
-  --api-key EMPTY \
-  --dataset simp \
-  --limit 1 \
-  --max-tokens 512 \
-  --output outputs/predictions.jsonl
-```
+To change the default dataset or output path for repo development, edit
+`DEFAULT_DATASET` or `DEFAULT_OUTPUT_PATH` in `main.py`.
 
 Use the real OpenAI API instead:
 
@@ -183,21 +251,13 @@ export OPENAI_MODEL=gpt-4o-mini
 
 python3 main.py \
   --provider openai \
-  --dataset simp \
   --limit 1 \
-  --max-tokens 512 \
-  --output outputs/predictions_openai.jsonl
-```
-
-Generate the complex dataset:
-
-```bash
-python3 main.py --provider modal-vllm --dataset comp --limit 1
+  --max-tokens 512
 ```
 
 The generated file is written to `outputs/predictions.jsonl` by default.
 
-## Run Evaluation on Modal
+## Batch Evaluation on Modal
 
 Install dependencies and authenticate Modal once:
 
@@ -206,15 +266,12 @@ python3 -m pip install -r requirements.txt
 modal setup
 ```
 
-Generate predictions locally, then run the Phase 1 call-accuracy evaluator on
-Modal:
+Generate predictions locally, then run Phase 1 call accuracy on Modal:
 
 ```bash
-python3 main.py --provider modal-vllm --limit 1 --output outputs/predictions.jsonl
+python3 main.py --provider modal-vllm --limit 1
 
-python3 evaluate.py \
-  --predictions outputs/predictions.jsonl \
-  --output-subdir results/phase1
+python3 evaluate.py --mode phase1 --predictions outputs/predictions.jsonl
 ```
 
 `evaluate.py` is a thin batch wrapper around:
@@ -224,24 +281,28 @@ modal run modal_eval_app.py::evaluate_phase1_only \
   --predictions outputs/predictions.jsonl
 ```
 
-To run Phase 1 followed by Phase 2 execution accuracy from a local
+Run Phase 1 followed by Phase 2 execution accuracy from a local
 `predictions.jsonl`:
 
 ```bash
-python3 evaluate.py \
-  --predictions outputs/predictions.jsonl \
-  --target-phase all \
-  --output-subdir results/phase1_phase2
+python3 evaluate.py --mode all --predictions outputs/predictions.jsonl
 ```
 
-To run Phase 2 later from an existing Phase 1 `call_acc` folder in the Modal
+Run Phase 2 later from an existing Phase 1 `call_acc` folder in the Modal
 Volume:
 
 ```bash
+python3 evaluate.py --mode phase2
+```
+
+By default this reads `results/phase1/call_acc` from the Modal Volume and writes
+Phase 2 artifacts to `results/phase2`. Pass `--call-acc-subdir` only for a
+different `call_acc/` directory, such as an agentic attempt:
+
+```bash
 python3 evaluate.py \
-  --target-phase phase2 \
-  --call-acc-subdir results/phase1/call_acc \
-  --output-subdir results/phase2
+  --mode phase2 \
+  --call-acc-subdir results/eval/agentic/div/attempt_003/call_acc
 ```
 
 This uses the same Modal image. Phase 2 consumes the `.py` files that survive
@@ -277,20 +338,20 @@ modal volume get deepbork-phase1-data results/phase1 ./local-phase1-results/
 Runtime knobs:
 
 ```bash
-DEEPBORK_PHASE1_GPU=A10 modal run modal_eval_app.py::evaluate_phase1_only \
+DEEPBORK_EVAL_GPU=A10 modal run modal_eval_app.py::evaluate_phase1_only \
   --predictions outputs/predictions.jsonl
 
 DEEPBORK_MODAL_VOLUME=my-volume modal run modal_eval_app.py::evaluate_phase1_only \
   --predictions outputs/predictions.jsonl
 ```
 
-This evaluation surface is the intended batch hook for the agentic loop: write
-one candidate prediction, call Modal evaluation, inspect `failed_phase` and the
-phase-specific passed/failed files, then decide whether to repair or accept.
+This evaluation surface is the deterministic hook used by the agentic loop:
+write one candidate prediction, call Modal evaluation, inspect `failed_phase`
+and the phase-specific passed/failed files, then repair or accept.
 
-## Agentic Evaluation MVP
+## Agentic Evaluation
 
-Run a simple one-operator repair loop:
+Run a one-operator repair loop targeting Phase 1:
 
 ```bash
 python3 agentic_eval.py \
@@ -299,13 +360,13 @@ python3 agentic_eval.py \
   --max-attempts 5
 ```
 
-Require Phase 1 and Phase 2 to pass:
+Require Phase 1 and Phase 2 to pass before accepting:
 
 ```bash
 python3 agentic_eval.py \
   --provider modal-vllm \
   --ops div \
-  --target-phase phase2 \
+  --target-stage phase2 \
   --max-attempts 5
 ```
 
@@ -315,7 +376,7 @@ The loop:
   `main.py`
 - generates an initial prediction with the normal prompt
 - writes one local `predictions.jsonl` per attempt
-- runs Modal evaluation through the requested target phase
+- runs Modal evaluation through the requested target stage
 - if evaluation fails, asks the model to repair the previous code using
   `stdout_tail` and `stderr_tail`
 - injects matching curated repair rules from the Phase 1 or Phase 2 rules file,
@@ -329,7 +390,6 @@ outputs/agentic_eval/<op>/
 │   ├── predictions.jsonl
 │   ├── predict.py
 │   ├── evaluation_summary.json
-│   ├── phase1_summary.json  # compatibility copy
 │   └── repair_prompt.json  # present when a repair attempt is needed
 └── result.json
 ```
@@ -337,7 +397,7 @@ outputs/agentic_eval/<op>/
 Remote Modal artifacts use unique per-attempt directories:
 
 ```text
-results/phase1/agentic/<op>/attempt_001/
+results/eval/agentic/<op>/attempt_001/
 ```
 
 Curated repair rules are data, not code. Add new recurring Phase 1 failure
@@ -355,24 +415,27 @@ repair_rules/triton_phase2_rules.json
 
 Each rule has match patterns over `previous_predict`, `phase1_output`,
 `phase2_output`, or `evaluation_output`, plus a problem description, fix, and
-avoid list. The agentic loop loads the files with `--repair-rules` and
-`--phase2-repair-rules`, then includes only the matching rules for the failed
-phase in the next repair prompt.
+avoid list. The agentic loop loads those default rule files and includes only
+the matching rules for the failed phase in the next repair prompt.
 
-## Scope
+## Current Implementation
 
-In scope:
+Implemented now:
 
 - read `data/TritonBench_T_<simp|comp>_alpac_v1.json`
 - build prompt messages
 - call either `modal_vllm` or OpenAI through the `openai` client
 - write `predictions.jsonl`
 - upload a local `predictions.jsonl` to Modal
-- run TritonBench-T Phase 1 and optionally Phase 2
-- return attempted, passed, and failed operator filenames
+- run TritonBench-T Phase 1 and Phase 2
+- keep Phase 1 and Phase 2 callable independently
+- run a simple agentic repair loop through a target stage
+- return attempted, passed, failed, and failed-stage information
 
-Out of scope:
+Planned next stages:
 
-- local Hugging Face inference
-- XGrammar runtime execution
-- full TritonBench Phase 3 performance benchmarking
+- add Phase 3 performance benchmarking as another modular evaluation stage
+- integrate XGrammar or equivalent local generation constraints
+- make phase-specific agentic policies easier to compose, e.g. agentic Phase 1
+  followed by deterministic Phase 2
+- expand repair rules from repeated Phase 1 and Phase 2 failures

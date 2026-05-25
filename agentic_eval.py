@@ -13,9 +13,10 @@ from main import (
     generate_text,
     load_alpaca,
     resolve_api_key,
+    resolve_endpoint,
     resolve_model,
 )
-from evaluate import DEFAULT_MODAL_APP, evaluate_local
+from evaluate import evaluate_local
 from tritonbench_helpers import (
     DEFAULT_METADATA_FILE,
     load_metadata,
@@ -32,6 +33,12 @@ except ModuleNotFoundError:
 
 DEFAULT_PHASE1_REPAIR_RULES = Path("repair_rules/triton_phase1_rules.json")
 DEFAULT_PHASE2_REPAIR_RULES = Path("repair_rules/triton_phase2_rules.json")
+DEFAULT_AGENTIC_DATA_DIR = DEFAULT_DATA_DIR
+DEFAULT_AGENTIC_DATASET = "simp"
+DEFAULT_AGENTIC_OUTPUT_DIR = Path("outputs/agentic_eval")
+DEFAULT_EVAL_OUTPUT_PREFIX = "results/eval/agentic"
+DEFAULT_TIMEOUT = 600
+STAGE_ORDER = ("phase1", "phase2")
 
 
 REPAIR_SYSTEM_PROMPT = """You are repairing a generated Triton Python module.
@@ -60,37 +67,15 @@ def parse_args() -> argparse.Namespace:
         description="Run a simple local generate/repair loop against Modal evaluation."
     )
     parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=DEFAULT_DATA_DIR,
-        help="Directory containing TritonBench-T prompt and metadata files.",
-    )
-    parser.add_argument(
         "--provider",
         choices=["modal-vllm", "openai"],
         default=provider_default,
         help="LLM provider. Both providers use the OpenAI Python client.",
     )
     parser.add_argument(
-        "--endpoint",
-        default=os.environ.get("DEFAULT_ENDPOINT"),
-        help="Base URL for modal-vllm. Ignored when --provider openai.",
-    )
-    parser.add_argument(
         "--model",
         default=None,
         help=f"Model name. Current provider default: {model_default}.",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="Override provider API key. Defaults to OPENAI_API_KEY or VLLM_API_KEY.",
-    )
-    parser.add_argument(
-        "--dataset",
-        choices=["simp", "comp"],
-        default="simp",
-        help="TritonBench Alpaca dataset variant.",
     )
     parser.add_argument(
         "--ops",
@@ -104,49 +89,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum total evaluation attempts, including the first generation.",
     )
     parser.add_argument(
-        "--target-phase",
-        choices=["phase1", "phase2"],
+        "--target-stage",
+        choices=STAGE_ORDER,
         default="phase1",
-        help="Stop after Phase 1, or require Phase 1 and Phase 2 to pass.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("outputs/agentic_eval"),
-        help="Local directory for attempt artifacts.",
-    )
-    parser.add_argument(
-        "--eval-output-prefix",
-        default="results/phase1/agentic",
-        help="Modal volume prefix for per-attempt evaluation artifacts.",
-    )
-    parser.add_argument(
-        "--modal-app",
-        type=Path,
-        default=DEFAULT_MODAL_APP,
-        help="Path to the Modal evaluation app file.",
-    )
-    parser.add_argument(
-        "--modal-bin",
-        default="modal",
-        help="Modal executable to invoke.",
-    )
-    parser.add_argument(
-        "--repair-rules",
-        type=Path,
-        default=DEFAULT_PHASE1_REPAIR_RULES,
-        help="JSON file containing curated Triton Phase 1 repair rules.",
-    )
-    parser.add_argument(
-        "--phase2-repair-rules",
-        type=Path,
-        default=DEFAULT_PHASE2_REPAIR_RULES,
-        help="JSON file containing curated Triton Phase 2 repair rules.",
+        help="Evaluation stage that each candidate must pass through before it is accepted.",
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=1024,
+        default=8192,
         help="Maximum generated tokens per model call.",
     )
     parser.add_argument(
@@ -155,22 +106,16 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="Sampling temperature for initial generation and repairs.",
     )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=600,
-        help="HTTP timeout in seconds per model request.",
-    )
     return parser.parse_args()
 
 
-def select_single_item(data_dir: Path, dataset: str, ops: str) -> tuple[str, dict]:
+def select_single_item(ops: str) -> tuple[str, dict]:
     requested_files = parse_ops(ops)
     if len(requested_files) != 1:
         raise ValueError("--ops must name exactly one operator for agentic evaluation")
 
-    metadata = load_metadata(data_dir / DEFAULT_METADATA_FILE)
-    items = load_alpaca(data_dir, dataset)
+    metadata = load_metadata(DEFAULT_AGENTIC_DATA_DIR / DEFAULT_METADATA_FILE)
+    items = load_alpaca(DEFAULT_AGENTIC_DATA_DIR, DEFAULT_AGENTIC_DATASET)
     selected = select_items_by_ops(items, metadata, requested_files)
     return requested_files[0], selected[0]
 
@@ -188,7 +133,7 @@ def build_repair_messages(
     attempt: int,
     max_attempts: int,
     repair_rules: list[dict],
-    failed_phase: str,
+    failed_stage: str,
 ) -> list[dict]:
     rules = format_repair_rules(
         match_repair_rules(
@@ -206,8 +151,8 @@ Previous generated code:
 Relevant repair rules:
 {rules}
 
-Failed phase:
-{failed_phase}
+Failed evaluation stage:
+{failed_stage}
 
 Evaluation stdout:
 {evaluation_result.get("stdout_tail", "")}
@@ -291,7 +236,6 @@ def generate_code(
     messages: list[dict],
     max_tokens: int,
     temperature: float,
-    timeout: int,
 ) -> str:
     raw = generate_text(
         provider=provider,
@@ -301,7 +245,7 @@ def generate_code(
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
-        timeout=timeout,
+        timeout=DEFAULT_TIMEOUT,
     )
     return extract_code(raw)
 
@@ -317,51 +261,66 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def is_passed(summary: dict, op_file: str, target_phase: str) -> bool:
-    if target_phase == "phase2":
+def mode_for_target_stage(target_stage: str) -> str:
+    if target_stage == "phase1":
+        return "phase1"
+    if target_stage == "phase2":
+        return "all"
+    raise ValueError(f"unknown target stage: {target_stage}")
+
+
+def is_passed(summary: dict, op_file: str, target_stage: str) -> bool:
+    if target_stage == "phase2":
         return op_file in set(summary.get("phase2_passed_files", []))
     return op_file in set(summary.get("phase1_passed_files", summary.get("passed_files", [])))
 
 
-def failed_phase(summary: dict, target_phase: str) -> str:
+def passed_through(summary: dict, op_file: str) -> str | None:
+    for stage in reversed(STAGE_ORDER):
+        if is_passed(summary, op_file, stage):
+            return stage
+    return None
+
+
+def failed_stage(summary: dict, target_stage: str) -> str:
     if summary.get("failed_phase"):
         return summary["failed_phase"]
-    if target_phase == "phase2" and summary.get("phase2_exec_acc", {}).get("failed", 0):
+    if target_stage == "phase2" and summary.get("phase2_exec_acc", {}).get("failed", 0):
         return "phase2"
     return "phase1"
 
 
 def validate_generation_config(provider: str, endpoint: str, api_key: str) -> None:
     if provider == "modal-vllm" and not endpoint:
-        raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT or pass --endpoint.")
+        raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT.")
     if provider == "openai" and not api_key:
-        raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY or pass --api-key.")
+        raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY.")
 
 
 def solve_item(args: argparse.Namespace) -> dict:
-    op_file, item = select_single_item(args.data_dir, args.dataset, args.ops)
+    op_file, item = select_single_item(args.ops)
     op_stem = op_file.removesuffix(".py")
 
-    api_key = resolve_api_key(args.provider, args.api_key)
+    endpoint = resolve_endpoint(args.provider)
+    api_key = resolve_api_key(args.provider)
     model = resolve_model(args.provider, args.model)
-    validate_generation_config(args.provider, args.endpoint, api_key)
-    phase1_repair_rules = load_repair_rules(args.repair_rules)
-    phase2_repair_rules = load_repair_rules(args.phase2_repair_rules)
+    validate_generation_config(args.provider, endpoint, api_key)
+    phase1_repair_rules = load_repair_rules(DEFAULT_PHASE1_REPAIR_RULES)
+    phase2_repair_rules = load_repair_rules(DEFAULT_PHASE2_REPAIR_RULES)
 
-    op_dir = args.output_dir / op_stem
+    op_dir = DEFAULT_AGENTIC_OUTPUT_DIR / op_stem
     op_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"agentic {args.target_phase} target: {op_file}", flush=True)
+    print(f"agentic target stage: {args.target_stage}, op: {op_file}", flush=True)
     print(f"generating initial candidate with {args.provider}/{model}", flush=True)
     predict = generate_code(
         provider=args.provider,
-        endpoint=args.endpoint,
+        endpoint=endpoint,
         api_key=api_key,
         model=model,
         messages=build_messages(item),
         max_tokens=args.max_tokens,
         temperature=args.temperature,
-        timeout=args.timeout,
     )
 
     last_summary = None
@@ -371,33 +330,33 @@ def solve_item(args: argparse.Namespace) -> dict:
         write_single_prediction(prediction_path, item["instruction"], predict)
         (attempt_dir / "predict.py").write_text(predict)
 
-        output_subdir = f"{args.eval_output_prefix}/{op_stem}/attempt_{attempt:03d}"
+        output_subdir = f"{DEFAULT_EVAL_OUTPUT_PREFIX}/{op_stem}/attempt_{attempt:03d}"
         print(
-            f"{args.target_phase} attempt {attempt}/{args.max_attempts}: {output_subdir}",
+            f"attempt {attempt}/{args.max_attempts}: evaluate through {args.target_stage} -> {output_subdir}",
             flush=True,
         )
         summary = evaluate_local(
             predictions=prediction_path,
             output_subdir=output_subdir,
-            modal_app=args.modal_app,
-            modal_bin=args.modal_bin,
-            target_phase="all" if args.target_phase == "phase2" else "phase1",
+            mode=mode_for_target_stage(args.target_stage),
         )
         last_summary = summary
         write_json(attempt_dir / "evaluation_summary.json", summary)
-        write_json(attempt_dir / "phase1_summary.json", summary)
-        metrics = summary.get("phase2_exec_acc" if args.target_phase == "phase2" else "phase1_call_acc", {})
+        current_passed_through = passed_through(summary, op_file)
+        metrics = summary.get("phase2_exec_acc" if args.target_stage == "phase2" else "phase1_call_acc", {})
         print(
-            f"{args.target_phase} result: "
+            f"evaluation through {args.target_stage}: "
             f"{metrics.get('passed', 0)}/{summary.get('total_predictions', 0)} "
-            f"passed ({metrics.get('rate', 0)}%)",
+            f"passed ({metrics.get('rate', 0)}%); "
+            f"passed through {current_passed_through or 'none'}",
             flush=True,
         )
 
-        if is_passed(summary, op_file, args.target_phase):
+        if is_passed(summary, op_file, args.target_stage):
             result = {
                 "passed": True,
-                "target_phase": args.target_phase,
+                "target_stage": args.target_stage,
+                "passed_through": args.target_stage,
                 "op_file": op_file,
                 "attempts": attempt,
                 "final_predict_path": str(attempt_dir / "predict.py"),
@@ -413,8 +372,8 @@ def solve_item(args: argparse.Namespace) -> dict:
         if failure_tail:
             print("evaluation failure tail:\n" + failure_tail[-1200:], flush=True)
 
-        current_failed_phase = failed_phase(summary, args.target_phase)
-        current_repair_rules = phase2_repair_rules if current_failed_phase == "phase2" else phase1_repair_rules
+        current_failed_stage = failed_stage(summary, args.target_stage)
+        current_repair_rules = phase2_repair_rules if current_failed_stage == "phase2" else phase1_repair_rules
         repair_messages = build_repair_messages(
             item=item,
             previous_predict=predict,
@@ -422,24 +381,24 @@ def solve_item(args: argparse.Namespace) -> dict:
             attempt=attempt,
             max_attempts=args.max_attempts,
             repair_rules=current_repair_rules,
-            failed_phase=current_failed_phase,
+            failed_stage=current_failed_stage,
         )
         (attempt_dir / "repair_prompt.json").write_text(json.dumps(repair_messages, indent=2) + "\n")
-        print(f"repairing candidate from {current_failed_phase} output", flush=True)
+        print(f"repairing candidate from {current_failed_stage} output", flush=True)
         predict = generate_code(
             provider=args.provider,
-            endpoint=args.endpoint,
+            endpoint=endpoint,
             api_key=api_key,
             model=model,
             messages=repair_messages,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            timeout=args.timeout,
         )
 
     result = {
         "passed": False,
-        "target_phase": args.target_phase,
+        "target_stage": args.target_stage,
+        "passed_through": passed_through(last_summary or {}, op_file),
         "op_file": op_file,
         "attempts": args.max_attempts,
         "final_predict_path": str(op_dir / f"attempt_{args.max_attempts:03d}" / "predict.py"),
@@ -454,7 +413,7 @@ def main() -> None:
         load_dotenv()
     args = parse_args()
     result = solve_item(args)
-    print(f"\n=== Agentic {args.target_phase} result ===")
+    print(f"\n=== Agentic target-stage {args.target_stage} result ===")
     print(json.dumps(result, indent=2))
 
 
