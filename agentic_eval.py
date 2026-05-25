@@ -16,7 +16,7 @@ from main import (
     resolve_endpoint,
     resolve_model,
 )
-from evaluate import evaluate_local
+from evaluate import evaluate_through
 from tritonbench_helpers import (
     DEFAULT_METADATA_FILE,
     load_metadata,
@@ -33,19 +33,20 @@ except ModuleNotFoundError:
 
 DEFAULT_PHASE1_REPAIR_RULES = Path("repair_rules/triton_phase1_rules.json")
 DEFAULT_PHASE2_REPAIR_RULES = Path("repair_rules/triton_phase2_rules.json")
+DEFAULT_PHASE3_REPAIR_RULES = Path("repair_rules/triton_phase3_rules.json")
 DEFAULT_AGENTIC_DATA_DIR = DEFAULT_DATA_DIR
 DEFAULT_AGENTIC_DATASET = "simp"
 DEFAULT_AGENTIC_OUTPUT_DIR = Path("outputs/agentic_eval")
 DEFAULT_EVAL_OUTPUT_PREFIX = "results/eval/agentic"
 DEFAULT_TIMEOUT = 600
-STAGE_ORDER = ("phase1", "phase2")
+STAGE_ORDER = ("phase1", "phase2", "phase3")
 
 
 REPAIR_SYSTEM_PROMPT = """You are repairing a generated Triton Python module.
 
 The previous generated code failed TritonBench-T evaluation.
 
-Phase 1 concatenates the generated Python module with the golden TritonBench-T test driver and executes the resulting file. Phase 2 re-runs surviving Phase 1 modules and compares their outputs with the golden implementation.
+Phase 1 concatenates the generated Python module with the golden TritonBench-T test driver and executes the resulting file. Phase 2 re-runs surviving Phase 1 modules and compares their outputs with the golden implementation. Phase 3 benchmarks Phase 2 survivors with TritonBench-T performance scripts.
 
 Your task:
 - Return a complete corrected Python module.
@@ -105,6 +106,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Sampling temperature for initial generation and repairs.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full result JSON instead of the compact terminal summary.",
     )
     return parser.parse_args()
 
@@ -190,6 +196,7 @@ def match_repair_rules(
         "previous_predict": previous_predict,
         "phase1_output": evaluation_output,
         "phase2_output": evaluation_output,
+        "phase3_output": evaluation_output,
         "evaluation_output": evaluation_output,
     }
     matched = []
@@ -261,15 +268,9 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def mode_for_target_stage(target_stage: str) -> str:
-    if target_stage == "phase1":
-        return "phase1"
-    if target_stage == "phase2":
-        return "all"
-    raise ValueError(f"unknown target stage: {target_stage}")
-
-
 def is_passed(summary: dict, op_file: str, target_stage: str) -> bool:
+    if target_stage == "phase3":
+        return op_file in set(summary.get("phase3_passed_files", []))
     if target_stage == "phase2":
         return op_file in set(summary.get("phase2_passed_files", []))
     return op_file in set(summary.get("phase1_passed_files", summary.get("passed_files", [])))
@@ -285,9 +286,58 @@ def passed_through(summary: dict, op_file: str) -> str | None:
 def failed_stage(summary: dict, target_stage: str) -> str:
     if summary.get("failed_phase"):
         return summary["failed_phase"]
+    if target_stage == "phase3" and summary.get("phase3_efficiency", {}).get("status") == "failed":
+        return "phase3"
     if target_stage == "phase2" and summary.get("phase2_exec_acc", {}).get("failed", 0):
         return "phase2"
     return "phase1"
+
+
+def phase_line(summary: dict, stage: str) -> str:
+    if stage == "phase1":
+        metrics = summary.get("phase1_call_acc", {})
+        passed = metrics.get("passed", 0)
+        failed = metrics.get("failed", 0)
+        rate = metrics.get("rate", 0)
+        return f"phase1: {passed} passed, {failed} failed ({rate}%)"
+    if stage == "phase2":
+        metrics = summary.get("phase2_exec_acc", {})
+        passed = metrics.get("passed", 0)
+        failed = metrics.get("failed", 0)
+        rate = metrics.get("rate", 0)
+        return f"phase2: {passed} passed, {failed} failed ({rate}%)"
+    phase3 = summary.get("phase3_efficiency", {})
+    status = phase3.get("status", "not-run")
+    speedup = phase3.get("speedup_vs_pytorch")
+    return f"phase3: {status}, speedup={speedup}"
+
+
+def print_attempt_summary(summary: dict, op_file: str, target_stage: str) -> None:
+    stages = STAGE_ORDER[: STAGE_ORDER.index(target_stage) + 1]
+    lines = [phase_line(summary, stage) for stage in stages]
+    print("evaluation: " + " | ".join(lines), flush=True)
+    print(f"passed through: {passed_through(summary, op_file) or 'none'}", flush=True)
+
+
+def compact_result(result: dict) -> dict:
+    summary = result.get("last_evaluation_result") or {}
+    return {
+        "passed": result.get("passed"),
+        "target_stage": result.get("target_stage"),
+        "passed_through": result.get("passed_through"),
+        "op_file": result.get("op_file"),
+        "attempts": result.get("attempts"),
+        "final_predict_path": result.get("final_predict_path"),
+        "result_path": result.get("result_path"),
+        "artifacts_volume": summary.get("artifacts_volume"),
+        "artifacts_subdir": summary.get("artifacts_subdir"),
+        "call_acc_dir": summary.get("call_acc_dir"),
+        "perf_results_dir": summary.get("perf_results_dir"),
+        "phase1": summary.get("phase1_call_acc"),
+        "phase2": summary.get("phase2_exec_acc"),
+        "phase3": summary.get("phase3_efficiency"),
+        "failed_phase": summary.get("failed_phase"),
+    }
 
 
 def validate_generation_config(provider: str, endpoint: str, api_key: str) -> None:
@@ -307,6 +357,7 @@ def solve_item(args: argparse.Namespace) -> dict:
     validate_generation_config(args.provider, endpoint, api_key)
     phase1_repair_rules = load_repair_rules(DEFAULT_PHASE1_REPAIR_RULES)
     phase2_repair_rules = load_repair_rules(DEFAULT_PHASE2_REPAIR_RULES)
+    phase3_repair_rules = load_repair_rules(DEFAULT_PHASE3_REPAIR_RULES)
 
     op_dir = DEFAULT_AGENTIC_OUTPUT_DIR / op_stem
     op_dir.mkdir(parents=True, exist_ok=True)
@@ -335,22 +386,14 @@ def solve_item(args: argparse.Namespace) -> dict:
             f"attempt {attempt}/{args.max_attempts}: evaluate through {args.target_stage} -> {output_subdir}",
             flush=True,
         )
-        summary = evaluate_local(
+        summary = evaluate_through(
             predictions=prediction_path,
             output_subdir=output_subdir,
-            mode=mode_for_target_stage(args.target_stage),
+            target_stage=args.target_stage,
         )
         last_summary = summary
         write_json(attempt_dir / "evaluation_summary.json", summary)
-        current_passed_through = passed_through(summary, op_file)
-        metrics = summary.get("phase2_exec_acc" if args.target_stage == "phase2" else "phase1_call_acc", {})
-        print(
-            f"evaluation through {args.target_stage}: "
-            f"{metrics.get('passed', 0)}/{summary.get('total_predictions', 0)} "
-            f"passed ({metrics.get('rate', 0)}%); "
-            f"passed through {current_passed_through or 'none'}",
-            flush=True,
-        )
+        print_attempt_summary(summary, op_file, args.target_stage)
 
         if is_passed(summary, op_file, args.target_stage):
             result = {
@@ -362,6 +405,7 @@ def solve_item(args: argparse.Namespace) -> dict:
                 "final_predict_path": str(attempt_dir / "predict.py"),
                 "last_evaluation_result": summary,
             }
+            result["result_path"] = str(op_dir / "result.json")
             write_json(op_dir / "result.json", result)
             return result
 
@@ -373,7 +417,12 @@ def solve_item(args: argparse.Namespace) -> dict:
             print("evaluation failure tail:\n" + failure_tail[-1200:], flush=True)
 
         current_failed_stage = failed_stage(summary, args.target_stage)
-        current_repair_rules = phase2_repair_rules if current_failed_stage == "phase2" else phase1_repair_rules
+        repair_rules_by_stage = {
+            "phase1": phase1_repair_rules,
+            "phase2": phase2_repair_rules,
+            "phase3": phase3_repair_rules,
+        }
+        current_repair_rules = repair_rules_by_stage.get(current_failed_stage, phase1_repair_rules)
         repair_messages = build_repair_messages(
             item=item,
             previous_predict=predict,
@@ -404,6 +453,7 @@ def solve_item(args: argparse.Namespace) -> dict:
         "final_predict_path": str(op_dir / f"attempt_{args.max_attempts:03d}" / "predict.py"),
         "last_evaluation_result": last_summary,
     }
+    result["result_path"] = str(op_dir / "result.json")
     write_json(op_dir / "result.json", result)
     return result
 
@@ -413,8 +463,8 @@ def main() -> None:
         load_dotenv()
     args = parse_args()
     result = solve_item(args)
-    print(f"\n=== Agentic target-stage {args.target_stage} result ===")
-    print(json.dumps(result, indent=2))
+    print(f"\n=== Agentic result: {'passed' if result.get('passed') else 'failed'} ===")
+    print(json.dumps(result if args.json else compact_result(result), indent=2))
 
 
 if __name__ == "__main__":
