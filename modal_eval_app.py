@@ -1,11 +1,11 @@
 """Modal evaluator for deepbork predictions.
 
-This app keeps TritonBench-T evaluation phases independently callable:
+This app is the Modal execution adapter for TritonBench-T evaluation phases:
 
 - Phase 1: upload/use a predictions.jsonl and run call accuracy.
 - Phase 2: use an existing Modal-volume call_acc folder and run execution accuracy.
 - Phase 3: use an existing Modal-volume call_acc folder and run efficiency benchmarking.
-- All: run Phase 1, Phase 2, then Phase 3.
+- All: run Phase 1, Phase 2, then Phase 3 in one Modal function call.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import modal
 
+from evaluation.model import PHASE_ORDER, PHASES
 from tritonbench_helpers import DEFAULT_METADATA_FILE, load_metadata, prediction_files
 
 
@@ -29,6 +30,8 @@ DEFAULT_GPU = os.environ.get("DEEPBORK_EVAL_GPU", os.environ.get("DEEPBORK_PHASE
 VOLUME_NAME = os.environ.get("DEEPBORK_MODAL_VOLUME", "deepbork-phase1-data")
 DATA_DIR = "/data"
 REPO_DIR = "/opt/TritonBench"
+EVAL_JSON_START = "DEEPBORK_EVAL_JSON_START"
+EVAL_JSON_END = "DEEPBORK_EVAL_JSON_END"
 
 
 PATCH_CALL_ACC = (
@@ -71,6 +74,7 @@ image = (
         f"ln -s {REPO_DIR}/EVAL/eval_T/1_exe_acc.py {REPO_DIR}/EVAL/eval_T/exe_acc.py",
     )
     .add_local_python_source("tritonbench_helpers")
+    .add_local_python_source("evaluation")
 )
 
 app = modal.App(APP_NAME, image=image)
@@ -168,7 +172,43 @@ def _prediction_files(predictions_path: Path) -> list[str]:
     return prediction_files(predictions_path, metadata)
 
 
-def _phase1_summary(
+def _artifacts(output_subdir: str, include_perf_results: bool = False) -> dict[str, str]:
+    artifacts = {
+        "artifacts_volume": VOLUME_NAME,
+        "artifacts_subdir": output_subdir,
+        "call_acc_dir": f"{output_subdir}/call_acc",
+        "logs_dir": f"{output_subdir}/logs",
+    }
+    if include_perf_results:
+        artifacts["perf_results_dir"] = f"{output_subdir}/perf_results"
+    return artifacts
+
+
+def _phase_summary(
+    phase: str,
+    output_subdir: str,
+    attempted: list[str],
+    passed: list[str],
+    failed: list[str],
+    metrics: dict,
+    stdout_text: str,
+    stderr_text: str,
+) -> dict:
+    status = metrics.get("status")
+    return {
+        "phase": phase,
+        "attempted_files": attempted,
+        "passed_files": passed,
+        "failed_files": failed,
+        "metrics": metrics,
+        "artifacts": _artifacts(output_subdir, include_perf_results=phase == "phase3"),
+        "stdout_tail": stdout_text[-4000:],
+        "stderr_tail": stderr_text[-4000:],
+        "failed": bool(failed) or status == "failed",
+    }
+
+
+def _phase1_result(
     output_subdir: str,
     attempted: list[str],
     passed: list[str],
@@ -177,31 +217,23 @@ def _phase1_summary(
     stderr_text: str,
 ) -> dict:
     total = len(attempted)
-    return {
-        "total_predictions": total,
-        "phase1_call_acc": {
+    return _phase_summary(
+        phase="phase1",
+        output_subdir=output_subdir,
+        attempted=attempted,
+        passed=passed,
+        failed=failed,
+        metrics={
             "passed": len(passed),
             "failed": len(failed),
             "rate": round(100 * len(passed) / total, 2) if total else 0,
         },
-        "failed_phase": "phase1" if failed else None,
-        "attempted_files": attempted,
-        "passed_files": passed,
-        "failed_files": failed,
-        "phase1_passed_files": passed,
-        "phase1_failed_files": failed,
-        "artifacts_volume": VOLUME_NAME,
-        "artifacts_subdir": output_subdir,
-        "call_acc_dir": f"{output_subdir}/call_acc",
-        "logs_dir": f"{output_subdir}/logs",
-        "stdout_tail": stdout_text[-4000:],
-        "stderr_tail": stderr_text[-4000:],
-        "phase1_stdout_tail": stdout_text[-4000:],
-        "phase1_stderr_tail": stderr_text[-4000:],
-    }
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+    )
 
 
-def _phase2_summary(
+def _phase2_result(
     output_subdir: str,
     candidate_files: list[str],
     passed: list[str],
@@ -210,28 +242,20 @@ def _phase2_summary(
     stderr_text: str,
 ) -> dict:
     total = len(candidate_files)
-    return {
-        "total_predictions": total,
-        "phase2_exec_acc": {
+    return _phase_summary(
+        phase="phase2",
+        output_subdir=output_subdir,
+        attempted=candidate_files,
+        passed=passed,
+        failed=failed,
+        metrics={
             "passed": len(passed),
             "failed": len(failed),
             "rate": round(100 * len(passed) / total, 2) if total else 0,
         },
-        "failed_phase": "phase2" if failed else None,
-        "attempted_files": candidate_files,
-        "passed_files": passed,
-        "failed_files": failed,
-        "phase2_passed_files": passed,
-        "phase2_failed_files": failed,
-        "artifacts_volume": VOLUME_NAME,
-        "artifacts_subdir": output_subdir,
-        "call_acc_dir": f"{output_subdir}/call_acc",
-        "logs_dir": f"{output_subdir}/logs",
-        "stdout_tail": stdout_text[-4000:],
-        "stderr_tail": stderr_text[-4000:],
-        "phase2_stdout_tail": stdout_text[-4000:],
-        "phase2_stderr_tail": stderr_text[-4000:],
-    }
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+    )
 
 
 def _parse_speedup(stdout_text: str) -> float | None:
@@ -245,7 +269,7 @@ def _parse_speedup(stdout_text: str) -> float | None:
     return None
 
 
-def _phase3_summary(
+def _phase3_result(
     output_subdir: str,
     candidate_files: list[str],
     speedup: float | None,
@@ -254,31 +278,23 @@ def _phase3_summary(
     returncode: int,
 ) -> dict:
     status = "skipped" if not candidate_files else "success" if returncode == 0 else "failed"
-    return {
-        "total_predictions": len(candidate_files),
-        "phase3_efficiency": {
+    passed = candidate_files if returncode == 0 else []
+    failed = [] if returncode == 0 else candidate_files
+    return _phase_summary(
+        phase="phase3",
+        output_subdir=output_subdir,
+        attempted=candidate_files,
+        passed=passed,
+        failed=failed,
+        metrics={
             "status": status,
             "speedup_vs_pytorch": speedup,
             "returncode": returncode,
             "raw_output_tail": stdout_text[-4000:],
         },
-        "failed_phase": "phase3" if returncode else None,
-        "attempted_files": candidate_files,
-        "passed_files": candidate_files if returncode == 0 else [],
-        "failed_files": [] if returncode == 0 else candidate_files,
-        "phase3_attempted_files": candidate_files,
-        "phase3_passed_files": candidate_files if returncode == 0 else [],
-        "phase3_failed_files": [] if returncode == 0 else candidate_files,
-        "artifacts_volume": VOLUME_NAME,
-        "artifacts_subdir": output_subdir,
-        "call_acc_dir": f"{output_subdir}/call_acc",
-        "perf_results_dir": f"{output_subdir}/perf_results",
-        "logs_dir": f"{output_subdir}/logs",
-        "stdout_tail": stdout_text[-4000:],
-        "stderr_tail": stderr_text[-4000:],
-        "phase3_stdout_tail": stdout_text[-4000:],
-        "phase3_stderr_tail": stderr_text[-4000:],
-    }
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+    )
 
 
 def _run_phase1(predictions_path: Path, output_subdir: str) -> tuple[dict, Path]:
@@ -292,7 +308,7 @@ def _run_phase1(predictions_path: Path, output_subdir: str) -> tuple[dict, Path]
     passed = sorted(path.name for path in call_acc_dir.glob("*.py"))
     passed_set = set(passed)
     failed = [file_name for file_name in attempted if file_name not in passed_set]
-    return _phase1_summary(output_subdir, attempted, passed, failed, stdout_text, stderr_text), call_acc_dir
+    return _phase1_result(output_subdir, attempted, passed, failed, stdout_text, stderr_text), call_acc_dir
 
 
 def _run_phase2_on_call_acc(call_acc_dir: Path, output_subdir: str) -> dict:
@@ -312,7 +328,7 @@ def _run_phase2_on_call_acc(call_acc_dir: Path, output_subdir: str) -> dict:
     passed = sorted(path.name for path in call_acc_dir.glob("*.py"))
     passed_set = set(passed)
     failed = [file_name for file_name in candidate_files if file_name not in passed_set]
-    return _phase2_summary(output_subdir, candidate_files, passed, failed, stdout_text, stderr_text)
+    return _phase2_result(output_subdir, candidate_files, passed, failed, stdout_text, stderr_text)
 
 
 def _run_phase3_on_call_acc(call_acc_dir: Path, output_subdir: str) -> dict:
@@ -332,7 +348,7 @@ def _run_phase3_on_call_acc(call_acc_dir: Path, output_subdir: str) -> dict:
         stderr_text = ""
         print(stdout_text, flush=True)
         _write_phase_logs(logs_dir, "phase3", stdout_text, stderr_text)
-        return _phase3_summary(output_subdir, [], None, stdout_text, stderr_text, 0)
+        return _phase3_result(output_subdir, [], None, stdout_text, stderr_text, 0)
 
     perf_root = f"{REPO_DIR}/performance_metrics/perf_T"
     eval_root = f"{REPO_DIR}/EVAL/eval_T"
@@ -382,7 +398,7 @@ def _run_phase3_on_call_acc(call_acc_dir: Path, output_subdir: str) -> dict:
     stderr_text = "".join(stderr_parts)
     speedup = _parse_speedup(stdout_text) if returncode == 0 else None
     _write_phase_logs(logs_dir, "phase3", stdout_text, stderr_text)
-    return _phase3_summary(output_subdir, candidate_files, speedup, stdout_text, stderr_text, returncode)
+    return _phase3_result(output_subdir, candidate_files, speedup, stdout_text, stderr_text, returncode)
 
 
 def _copy_call_acc(call_acc_subdir: str, output_subdir: str) -> Path:
@@ -402,49 +418,6 @@ def _copy_call_acc(call_acc_subdir: str, output_subdir: str) -> Path:
     return destination
 
 
-def _combine_phase_summaries(phase1: dict, phase2: dict | None, phase3: dict | None = None) -> dict:
-    stdout_tail = (
-        phase1.get("phase1_stdout_tail", "")
-        + (phase2 or {}).get("phase2_stdout_tail", "")
-        + (phase3 or {}).get("phase3_stdout_tail", "")
-    )[-4000:]
-    stderr_tail = (
-        phase1.get("phase1_stderr_tail", "")
-        + (phase2 or {}).get("phase2_stderr_tail", "")
-        + (phase3 or {}).get("phase3_stderr_tail", "")
-    )[-4000:]
-    failed_phase = (
-        phase1.get("failed_phase")
-        or (phase2 or {}).get("failed_phase")
-        or (phase3 or {}).get("failed_phase")
-    )
-    combined = dict(phase1)
-    combined.update({"failed_phase": failed_phase, "stdout_tail": stdout_tail, "stderr_tail": stderr_tail})
-    if phase2 is not None:
-        combined.update(
-            {
-                "phase2_exec_acc": phase2["phase2_exec_acc"],
-                "phase2_passed_files": phase2["phase2_passed_files"],
-                "phase2_failed_files": phase2["phase2_failed_files"],
-                "phase2_stdout_tail": phase2["phase2_stdout_tail"],
-                "phase2_stderr_tail": phase2["phase2_stderr_tail"],
-            }
-        )
-    if phase3 is not None:
-        combined.update(
-            {
-                "phase3_efficiency": phase3["phase3_efficiency"],
-                "phase3_attempted_files": phase3["phase3_attempted_files"],
-                "phase3_passed_files": phase3["phase3_passed_files"],
-                "phase3_failed_files": phase3["phase3_failed_files"],
-                "phase3_stdout_tail": phase3["phase3_stdout_tail"],
-                "phase3_stderr_tail": phase3["phase3_stderr_tail"],
-                "perf_results_dir": phase3["perf_results_dir"],
-            }
-        )
-    return combined
-
-
 def _upload_local_predictions(local_path: Path) -> str:
     if not local_path.exists():
         raise FileNotFoundError(local_path)
@@ -457,141 +430,113 @@ def _upload_local_predictions(local_path: Path) -> str:
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=60 * 60 * 3, volumes={DATA_DIR: data_volume})
-def evaluate_phase1(
-    predictions_path: str = "predictions.jsonl",
-    output_subdir: str = "results/phase1",
-) -> dict:
-    pred_full = _volume_path(predictions_path)
-    if not pred_full.exists():
-        raise FileNotFoundError(f"predictions file not found in volume: {pred_full}")
-    summary, _ = _run_phase1(pred_full, output_subdir)
+def run_phase_remote(request: dict) -> dict:
+    phase = request.get("phase")
+    output_subdir = request.get("output_subdir", "")
+    predictions_path = request.get("predictions_path", "")
+    call_acc_subdir = request.get("call_acc_subdir", "")
+
+    if phase not in PHASES:
+        raise ValueError(f"unknown evaluation phase: {phase}")
+    if not output_subdir:
+        raise ValueError("output_subdir is required")
+
+    if phase == "phase1":
+        if not predictions_path:
+            raise ValueError("phase1 requires predictions_path")
+        pred_full = _volume_path(predictions_path)
+        if not pred_full.exists():
+            raise FileNotFoundError(f"predictions file not found in volume: {pred_full}")
+        result, _ = _run_phase1(pred_full, output_subdir)
+    elif phase == "phase2":
+        if not call_acc_subdir:
+            raise ValueError("phase2 requires call_acc_subdir")
+        call_acc_dir = _copy_call_acc(call_acc_subdir, output_subdir)
+        result = _run_phase2_on_call_acc(call_acc_dir, output_subdir)
+    elif phase == "phase3":
+        if not call_acc_subdir:
+            raise ValueError("phase3 requires call_acc_subdir")
+        call_acc_dir = _copy_call_acc(call_acc_subdir, output_subdir)
+        result = _run_phase3_on_call_acc(call_acc_dir, output_subdir)
+
     data_volume.commit()
-    return summary
+    return result
+
+
+def _pipeline_artifacts(output_subdir: str) -> dict[str, str]:
+    return _artifacts(output_subdir, include_perf_results=True)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=60 * 60 * 3, volumes={DATA_DIR: data_volume})
-def evaluate_phase2(
-    call_acc_subdir: str,
-    output_subdir: str = "results/phase2",
-) -> dict:
-    call_acc_dir = _copy_call_acc(call_acc_subdir, output_subdir)
-    summary = _run_phase2_on_call_acc(call_acc_dir, output_subdir)
-    data_volume.commit()
-    return summary
+def run_pipeline_remote(request: dict) -> dict:
+    phases = request.get("phases")
+    if phases != list(PHASE_ORDER):
+        raise ValueError(f"run_pipeline_remote currently supports only {list(PHASE_ORDER)}")
 
+    output_subdir = request.get("output_subdir", "results/all")
+    predictions_path = request.get("predictions_path", "")
+    if not predictions_path:
+        raise ValueError("pipeline requires predictions_path")
 
-@app.function(gpu=DEFAULT_GPU, timeout=60 * 60 * 3, volumes={DATA_DIR: data_volume})
-def evaluate_phase3(
-    call_acc_subdir: str,
-    output_subdir: str = "results/phase3",
-) -> dict:
-    call_acc_dir = _copy_call_acc(call_acc_subdir, output_subdir)
-    summary = _run_phase3_on_call_acc(call_acc_dir, output_subdir)
-    data_volume.commit()
-    return summary
-
-
-@app.function(gpu=DEFAULT_GPU, timeout=60 * 60 * 3, volumes={DATA_DIR: data_volume})
-def evaluate_through_phase2(
-    predictions_path: str = "predictions.jsonl",
-    output_subdir: str = "results/phase1_phase2",
-) -> dict:
-    pred_full = _volume_path(predictions_path)
-    if not pred_full.exists():
-        raise FileNotFoundError(f"predictions file not found in volume: {pred_full}")
-
-    phase1, call_acc_dir = _run_phase1(pred_full, output_subdir)
-    phase2 = None
-    if phase1["phase1_passed_files"]:
-        phase2 = _run_phase2_on_call_acc(call_acc_dir, output_subdir)
-    else:
-        logs_dir = _volume_path(output_subdir) / "logs"
-        _write_phase_logs(logs_dir, "phase2", "skipped Phase 2: no Phase 1 survivors\n", "")
-        phase2 = _phase2_summary(output_subdir, [], [], [], "skipped Phase 2: no Phase 1 survivors\n", "")
-
-    summary = _combine_phase_summaries(phase1, phase2)
-    data_volume.commit()
-    return summary
-
-
-@app.function(gpu=DEFAULT_GPU, timeout=60 * 60 * 3, volumes={DATA_DIR: data_volume})
-def evaluate_all(
-    predictions_path: str = "predictions.jsonl",
-    output_subdir: str = "results/all",
-) -> dict:
     pred_full = _volume_path(predictions_path)
     if not pred_full.exists():
         raise FileNotFoundError(f"predictions file not found in volume: {pred_full}")
 
     phase1, call_acc_dir = _run_phase1(pred_full, output_subdir)
-    if phase1["phase1_passed_files"]:
-        phase2 = _run_phase2_on_call_acc(call_acc_dir, output_subdir)
-    else:
-        logs_dir = _volume_path(output_subdir) / "logs"
-        _write_phase_logs(logs_dir, "phase2", "skipped Phase 2: no Phase 1 survivors\n", "")
-        phase2 = _phase2_summary(output_subdir, [], [], [], "skipped Phase 2: no Phase 1 survivors\n", "")
+    phase2 = _run_phase2_on_call_acc(call_acc_dir, output_subdir)
+    phase3 = _run_phase3_on_call_acc(call_acc_dir, output_subdir)
 
-    if phase2["phase2_passed_files"]:
-        phase3 = _run_phase3_on_call_acc(call_acc_dir, output_subdir)
-    else:
-        logs_dir = _volume_path(output_subdir) / "logs"
-        _write_phase_logs(logs_dir, "phase3", "skipped Phase 3: no Phase 2 survivors\n", "")
-        phase3 = _phase3_summary(output_subdir, [], None, "skipped Phase 3: no Phase 2 survivors\n", "", 0)
-
-    summary = _combine_phase_summaries(phase1, phase2, phase3)
     data_volume.commit()
-    return summary
+    return {
+        "phases": list(PHASE_ORDER),
+        "results": [phase1, phase2, phase3],
+        "artifacts": _pipeline_artifacts(output_subdir),
+    }
+
+
+def _phase_request(
+    phase: str,
+    output_subdir: str,
+    predictions: str = "",
+    call_acc_subdir: str = "",
+) -> dict:
+    return {
+        "phase": phase,
+        "predictions_path": _upload_local_predictions(Path(predictions)) if phase == "phase1" else "",
+        "call_acc_subdir": call_acc_subdir,
+        "output_subdir": output_subdir,
+    }
+
+
+def _pipeline_request(predictions: str, output_subdir: str) -> dict:
+    return {
+        "phases": list(PHASE_ORDER),
+        "predictions_path": _upload_local_predictions(Path(predictions)),
+        "output_subdir": output_subdir,
+    }
+
+
+def _print_eval_json(summary: dict) -> None:
+    print(EVAL_JSON_START)
+    print(json.dumps(summary))
+    print(EVAL_JSON_END)
 
 
 @app.local_entrypoint()
-def evaluate_phase1_only(
-    predictions: str,
-    output_subdir: str = "results/phase1",
+def run_phase(
+    phase: str,
+    output_subdir: str,
+    predictions: str = "",
+    call_acc_subdir: str = "",
 ):
-    remote = _upload_local_predictions(Path(predictions))
-    summary = evaluate_phase1.remote(predictions_path=remote, output_subdir=output_subdir)
-    print(json.dumps(summary, indent=2))
+    summary = run_phase_remote.remote(_phase_request(phase, output_subdir, predictions, call_acc_subdir))
+    _print_eval_json(summary)
 
 
 @app.local_entrypoint()
-def evaluate_phase2_only(
-    call_acc_subdir: str,
-    output_subdir: str = "results/phase2",
-):
-    summary = evaluate_phase2.remote(
-        call_acc_subdir=call_acc_subdir,
-        output_subdir=output_subdir,
-    )
-    print(json.dumps(summary, indent=2))
-
-
-@app.local_entrypoint()
-def evaluate_phase3_only(
-    call_acc_subdir: str,
-    output_subdir: str = "results/phase3",
-):
-    summary = evaluate_phase3.remote(
-        call_acc_subdir=call_acc_subdir,
-        output_subdir=output_subdir,
-    )
-    print(json.dumps(summary, indent=2))
-
-
-@app.local_entrypoint()
-def evaluate_through_phase2_entrypoint(
-    predictions: str,
-    output_subdir: str = "results/phase1_phase2",
-):
-    remote = _upload_local_predictions(Path(predictions))
-    summary = evaluate_through_phase2.remote(predictions_path=remote, output_subdir=output_subdir)
-    print(json.dumps(summary, indent=2))
-
-
-@app.local_entrypoint()
-def evaluate_all_entrypoint(
+def run_pipeline(
     predictions: str,
     output_subdir: str = "results/all",
 ):
-    remote = _upload_local_predictions(Path(predictions))
-    summary = evaluate_all.remote(predictions_path=remote, output_subdir=output_subdir)
-    print(json.dumps(summary, indent=2))
+    summary = run_pipeline_remote.remote(_pipeline_request(predictions, output_subdir))
+    _print_eval_json(summary)

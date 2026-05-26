@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 from pathlib import Path
 
 from main import (
@@ -16,7 +15,15 @@ from main import (
     resolve_endpoint,
     resolve_model,
 )
-from evaluate import evaluate_through
+from evaluate import (
+    STAGE_ORDER,
+    evaluate_local,
+    failed_stage,
+    is_passed,
+    passed_through,
+    phase_result,
+    phase_line,
+)
 from tritonbench_helpers import (
     DEFAULT_METADATA_FILE,
     load_metadata,
@@ -31,15 +38,16 @@ except ModuleNotFoundError:
     load_dotenv = None
 
 
-DEFAULT_PHASE1_REPAIR_RULES = Path("repair_rules/triton_phase1_rules.json")
-DEFAULT_PHASE2_REPAIR_RULES = Path("repair_rules/triton_phase2_rules.json")
-DEFAULT_PHASE3_REPAIR_RULES = Path("repair_rules/triton_phase3_rules.json")
 DEFAULT_AGENTIC_DATA_DIR = DEFAULT_DATA_DIR
 DEFAULT_AGENTIC_DATASET = "simp"
 DEFAULT_AGENTIC_OUTPUT_DIR = Path("outputs/agentic_eval")
 DEFAULT_EVAL_OUTPUT_PREFIX = "results/eval/agentic"
 DEFAULT_TIMEOUT = 600
-STAGE_ORDER = ("phase1", "phase2", "phase3")
+AGENTIC_TARGETS = ("phase1", "all")
+PASS_STAGE = {
+    "phase1": "phase1",
+    "all": "phase3",
+}
 
 
 REPAIR_SYSTEM_PROMPT = """You are repairing a generated Triton Python module.
@@ -91,9 +99,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target-stage",
-        choices=STAGE_ORDER,
+        choices=AGENTIC_TARGETS,
         default="phase1",
-        help="Evaluation stage that each candidate must pass through before it is accepted.",
+        help="Acceptance target: Phase 1 only or the complete Phase 1+2+3 pipeline.",
     )
     parser.add_argument(
         "--max-tokens",
@@ -138,24 +146,13 @@ def build_repair_messages(
     evaluation_result: dict,
     attempt: int,
     max_attempts: int,
-    repair_rules: list[dict],
     failed_stage: str,
 ) -> list[dict]:
-    rules = format_repair_rules(
-        match_repair_rules(
-            previous_predict=previous_predict,
-            evaluation_result=evaluation_result,
-            repair_rules=repair_rules,
-        )
-    )
     user = f"""Original benchmark instruction:
 {benchmark_text(item)}
 
 Previous generated code:
 {previous_predict}
-
-Relevant repair rules:
-{rules}
 
 Failed evaluation stage:
 {failed_stage}
@@ -166,6 +163,18 @@ Evaluation stdout:
 Evaluation stderr:
 {evaluation_result.get("stderr_tail", "")}
 
+Passed files:
+{json.dumps(evaluation_result.get("passed_files", []))}
+
+Failed files:
+{json.dumps(evaluation_result.get("failed_files", []))}
+
+Evaluation artifacts:
+{json.dumps(evaluation_result.get("artifacts", {}), indent=2)}
+
+Passed through:
+{evaluation_result.get("passed_through")}
+
 Repair attempt:
 {attempt + 1} of {max_attempts}
 """
@@ -173,66 +182,6 @@ Repair attempt:
         {"role": "system", "content": REPAIR_SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
-
-
-def load_repair_rules(path: Path) -> list[dict]:
-    if not path.exists():
-        raise FileNotFoundError(f"repair rules file not found: {path}")
-    data = json.loads(path.read_text())
-    if not isinstance(data, list):
-        raise ValueError(f"repair rules file must contain a JSON list: {path}")
-    return data
-
-
-def match_repair_rules(
-    previous_predict: str,
-    evaluation_result: dict,
-    repair_rules: list[dict],
-) -> list[dict]:
-    evaluation_output = (evaluation_result.get("stdout_tail", "") or "") + "\n" + (
-        evaluation_result.get("stderr_tail", "") or ""
-    )
-    sources = {
-        "previous_predict": previous_predict,
-        "phase1_output": evaluation_output,
-        "phase2_output": evaluation_output,
-        "phase3_output": evaluation_output,
-        "evaluation_output": evaluation_output,
-    }
-    matched = []
-    for rule in repair_rules:
-        patterns = rule.get("match", [])
-        if any(rule_pattern_matches(pattern, sources) for pattern in patterns):
-            matched.append(rule)
-    return matched
-
-
-def rule_pattern_matches(pattern: dict, sources: dict[str, str]) -> bool:
-    source = sources.get(pattern.get("source", ""), "")
-    if "contains" in pattern:
-        return pattern["contains"] in source
-    if "regex" in pattern:
-        return re.search(pattern["regex"], source, flags=re.DOTALL) is not None
-    return False
-
-
-def format_repair_rules(rules: list[dict]) -> str:
-    if not rules:
-        return "- No curated rule matched. Use the traceback line number and error message to make the smallest valid Triton fix."
-
-    blocks = []
-    for rule in rules:
-        lines = [
-            f"- [{rule.get('id', 'unnamed_rule')}]",
-            f"  Problem: {rule.get('problem', '')}",
-            f"  Fix: {rule.get('fix', '')}",
-        ]
-        avoid = rule.get("avoid") or []
-        if avoid:
-            lines.append("  Avoid:")
-            lines.extend(f"  - {item}" for item in avoid)
-        blocks.append("\n".join(lines))
-    return "\n".join(blocks)
 
 
 def generate_code(
@@ -268,52 +217,13 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def is_passed(summary: dict, op_file: str, target_stage: str) -> bool:
-    if target_stage == "phase3":
-        return op_file in set(summary.get("phase3_passed_files", []))
-    if target_stage == "phase2":
-        return op_file in set(summary.get("phase2_passed_files", []))
-    return op_file in set(summary.get("phase1_passed_files", summary.get("passed_files", [])))
-
-
-def passed_through(summary: dict, op_file: str) -> str | None:
-    for stage in reversed(STAGE_ORDER):
-        if is_passed(summary, op_file, stage):
-            return stage
-    return None
-
-
-def failed_stage(summary: dict, target_stage: str) -> str:
-    if summary.get("failed_phase"):
-        return summary["failed_phase"]
-    if target_stage == "phase3" and summary.get("phase3_efficiency", {}).get("status") == "failed":
-        return "phase3"
-    if target_stage == "phase2" and summary.get("phase2_exec_acc", {}).get("failed", 0):
-        return "phase2"
-    return "phase1"
-
-
-def phase_line(summary: dict, stage: str) -> str:
-    if stage == "phase1":
-        metrics = summary.get("phase1_call_acc", {})
-        passed = metrics.get("passed", 0)
-        failed = metrics.get("failed", 0)
-        rate = metrics.get("rate", 0)
-        return f"phase1: {passed} passed, {failed} failed ({rate}%)"
-    if stage == "phase2":
-        metrics = summary.get("phase2_exec_acc", {})
-        passed = metrics.get("passed", 0)
-        failed = metrics.get("failed", 0)
-        rate = metrics.get("rate", 0)
-        return f"phase2: {passed} passed, {failed} failed ({rate}%)"
-    phase3 = summary.get("phase3_efficiency", {})
-    status = phase3.get("status", "not-run")
-    speedup = phase3.get("speedup_vs_pytorch")
-    return f"phase3: {status}, speedup={speedup}"
+def pass_stage(target_stage: str) -> str:
+    return PASS_STAGE[target_stage]
 
 
 def print_attempt_summary(summary: dict, op_file: str, target_stage: str) -> None:
-    stages = STAGE_ORDER[: STAGE_ORDER.index(target_stage) + 1]
+    target = pass_stage(target_stage)
+    stages = STAGE_ORDER[: STAGE_ORDER.index(target) + 1]
     lines = [phase_line(summary, stage) for stage in stages]
     print("evaluation: " + " | ".join(lines), flush=True)
     print(f"passed through: {passed_through(summary, op_file) or 'none'}", flush=True)
@@ -321,6 +231,7 @@ def print_attempt_summary(summary: dict, op_file: str, target_stage: str) -> Non
 
 def compact_result(result: dict) -> dict:
     summary = result.get("last_evaluation_result") or {}
+    artifacts = summary.get("artifacts", {})
     return {
         "passed": result.get("passed"),
         "target_stage": result.get("target_stage"),
@@ -329,13 +240,13 @@ def compact_result(result: dict) -> dict:
         "attempts": result.get("attempts"),
         "final_predict_path": result.get("final_predict_path"),
         "result_path": result.get("result_path"),
-        "artifacts_volume": summary.get("artifacts_volume"),
-        "artifacts_subdir": summary.get("artifacts_subdir"),
-        "call_acc_dir": summary.get("call_acc_dir"),
-        "perf_results_dir": summary.get("perf_results_dir"),
-        "phase1": summary.get("phase1_call_acc"),
-        "phase2": summary.get("phase2_exec_acc"),
-        "phase3": summary.get("phase3_efficiency"),
+        "artifacts_volume": artifacts.get("artifacts_volume"),
+        "artifacts_subdir": artifacts.get("artifacts_subdir"),
+        "call_acc_dir": artifacts.get("call_acc_dir"),
+        "perf_results_dir": artifacts.get("perf_results_dir"),
+        "phase1": (phase_result(summary, "phase1") or {}).get("metrics"),
+        "phase2": (phase_result(summary, "phase2") or {}).get("metrics"),
+        "phase3": (phase_result(summary, "phase3") or {}).get("metrics"),
         "failed_phase": summary.get("failed_phase"),
     }
 
@@ -355,9 +266,6 @@ def solve_item(args: argparse.Namespace) -> dict:
     api_key = resolve_api_key(args.provider)
     model = resolve_model(args.provider, args.model)
     validate_generation_config(args.provider, endpoint, api_key)
-    phase1_repair_rules = load_repair_rules(DEFAULT_PHASE1_REPAIR_RULES)
-    phase2_repair_rules = load_repair_rules(DEFAULT_PHASE2_REPAIR_RULES)
-    phase3_repair_rules = load_repair_rules(DEFAULT_PHASE3_REPAIR_RULES)
 
     op_dir = DEFAULT_AGENTIC_OUTPUT_DIR / op_stem
     op_dir.mkdir(parents=True, exist_ok=True)
@@ -386,20 +294,21 @@ def solve_item(args: argparse.Namespace) -> dict:
             f"attempt {attempt}/{args.max_attempts}: evaluate through {args.target_stage} -> {output_subdir}",
             flush=True,
         )
-        summary = evaluate_through(
+        summary = evaluate_local(
+            mode=args.target_stage,
             predictions=prediction_path,
             output_subdir=output_subdir,
-            target_stage=args.target_stage,
         )
         last_summary = summary
         write_json(attempt_dir / "evaluation_summary.json", summary)
         print_attempt_summary(summary, op_file, args.target_stage)
 
-        if is_passed(summary, op_file, args.target_stage):
+        target_pass_stage = pass_stage(args.target_stage)
+        if is_passed(summary, op_file, target_pass_stage):
             result = {
                 "passed": True,
                 "target_stage": args.target_stage,
-                "passed_through": args.target_stage,
+                "passed_through": target_pass_stage,
                 "op_file": op_file,
                 "attempts": attempt,
                 "final_predict_path": str(attempt_dir / "predict.py"),
@@ -412,24 +321,20 @@ def solve_item(args: argparse.Namespace) -> dict:
         if attempt == args.max_attempts:
             break
 
-        failure_tail = summary.get("stderr_tail") or summary.get("stdout_tail") or ""
+        current_failed_stage = failed_stage(summary, pass_stage(args.target_stage))
+        failed_result = dict(phase_result(summary, current_failed_stage) or {})
+        failed_result["artifacts"] = summary.get("artifacts", failed_result.get("artifacts", {}))
+        failed_result["passed_through"] = summary.get("passed_through")
+        failure_tail = failed_result.get("stderr_tail") or failed_result.get("stdout_tail") or ""
         if failure_tail:
             print("evaluation failure tail:\n" + failure_tail[-1200:], flush=True)
 
-        current_failed_stage = failed_stage(summary, args.target_stage)
-        repair_rules_by_stage = {
-            "phase1": phase1_repair_rules,
-            "phase2": phase2_repair_rules,
-            "phase3": phase3_repair_rules,
-        }
-        current_repair_rules = repair_rules_by_stage.get(current_failed_stage, phase1_repair_rules)
         repair_messages = build_repair_messages(
             item=item,
             previous_predict=predict,
-            evaluation_result=summary,
+            evaluation_result=failed_result,
             attempt=attempt,
             max_attempts=args.max_attempts,
-            repair_rules=current_repair_rules,
             failed_stage=current_failed_stage,
         )
         (attempt_dir / "repair_prompt.json").write_text(json.dumps(repair_messages, indent=2) + "\n")
