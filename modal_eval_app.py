@@ -26,8 +26,9 @@ from tritonbench_helpers import DEFAULT_METADATA_FILE, load_metadata, prediction
 APP_NAME = "deepbork-eval"
 TRITONBENCH_REPO = "https://github.com/thunlp/TritonBench.git"
 
-DEFAULT_GPU = os.environ.get("DEEPBORK_EVAL_GPU", os.environ.get("DEEPBORK_PHASE1_GPU", "T4"))
+DEFAULT_GPU = os.environ.get("DEEPBORK_EVAL_GPU", os.environ.get("DEEPBORK_PHASE1_GPU", "A100-40GB"))
 VOLUME_NAME = os.environ.get("DEEPBORK_MODAL_VOLUME", "deepbork-phase1-data")
+SCALEDOWN_WINDOW = int(os.environ.get("DEEPBORK_EVAL_SCALEDOWN_WINDOW", "180"))
 DATA_DIR = "/data"
 REPO_DIR = "/opt/TritonBench"
 EVAL_JSON_START = "DEEPBORK_EVAL_JSON_START"
@@ -429,7 +430,11 @@ def _upload_local_predictions(local_path: Path) -> str:
     return remote
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=60 * 60 * 3, volumes={DATA_DIR: data_volume})
+@app.function(
+    gpu=DEFAULT_GPU,
+    timeout=60 * 60 * 3,
+    volumes={DATA_DIR: data_volume},
+)
 def run_phase_remote(request: dict) -> dict:
     phase = request.get("phase")
     output_subdir = request.get("output_subdir", "")
@@ -467,8 +472,15 @@ def _pipeline_artifacts(output_subdir: str) -> dict[str, str]:
     return _artifacts(output_subdir, include_perf_results=True)
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=60 * 60 * 3, volumes={DATA_DIR: data_volume})
+@app.function(
+    gpu=DEFAULT_GPU,
+    timeout=60 * 60 * 3,
+    volumes={DATA_DIR: data_volume},
+    scaledown_window=SCALEDOWN_WINDOW,
+)
 def run_pipeline_remote(request: dict) -> dict:
+    data_volume.reload()
+
     phases = request.get("phases")
     if phases != list(PHASE_ORDER):
         raise ValueError(f"run_pipeline_remote currently supports only {list(PHASE_ORDER)}")

@@ -290,6 +290,10 @@ Run the full Phase 1, Phase 2, and Phase 3 pipeline from a local
 python3 evaluate.py --mode all --predictions outputs/predictions.jsonl
 ```
 
+`--mode all` calls the deployed Modal app's `run_pipeline_remote` function.
+Deploy `modal_eval_app.py` before using this mode. Standalone `phase1`,
+`phase2`, and `phase3` still use `modal run modal_eval_app.py::run_phase`.
+
 Run Phase 2 later from an existing Phase 1 `call_acc` folder in the Modal
 Volume:
 
@@ -379,6 +383,25 @@ write one candidate prediction, call Modal evaluation, inspect `failed_phase`
 and the phase-specific passed/failed files, then repair or accept.
 
 ## Agentic Evaluation
+
+The full agentic pipeline target (`--target-stage all`) calls the deployed
+Modal app instead of creating a new ephemeral Modal app for every attempt.
+Configure Modal settings such as `DEEPBORK_EVAL_GPU`,
+`DEEPBORK_EVAL_SCALEDOWN_WINDOW`, `DEEPBORK_MODAL_VOLUME`, and provider
+credentials in `.env`, then deploy once from the repo root:
+
+```bash
+modal deploy modal_eval_app.py
+```
+
+The deployed app name defaults to `deepbork-eval`. If you change
+`APP_NAME` in `modal_eval_app.py`, set `DEEPBORK_MODAL_APP_NAME` in `.env`
+to the same value before running evaluation.
+
+Each agentic attempt writes a local `predictions.jsonl`, uploads that exact
+file to a unique Modal Volume path, then invokes the deployed pipeline. The
+remote pipeline reloads the volume before reading the uploaded file so warm
+containers see new attempts.
 
 Run a one-operator repair loop targeting Phase 1:
 
