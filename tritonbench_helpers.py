@@ -135,3 +135,15 @@ def select_items_by_ops(
         selected.append(matches[0])
 
     return selected
+
+
+def item_file_pairs(items: list[dict], metadata: list[dict]) -> list[tuple[str, dict]]:
+    records_by_description = metadata_by_description(metadata)
+    pairs = []
+    for index, item in enumerate(items, start=1):
+        description = normalize_description(extract_functional_description(item["instruction"]))
+        match = records_by_description.get(description)
+        if not match or not match.get("file"):
+            raise ValueError(f"dataset item {index} has no matching metadata file")
+        pairs.append((match["file"], item))
+    return pairs

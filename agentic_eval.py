@@ -26,6 +26,7 @@ from evaluate import (
 )
 from tritonbench_helpers import (
     DEFAULT_METADATA_FILE,
+    item_file_pairs,
     load_metadata,
     parse_ops,
     select_items_by_ops,
@@ -88,8 +89,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ops",
-        required=True,
-        help="One TritonBench-T operator filename stem, e.g. div or tanh.",
+        default="",
+        help=(
+            "Comma-separated TritonBench-T operator filename stems, e.g. div,tanh. "
+            "If omitted, --limit selects from the dataset."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Run agentic evaluation for the first N dataset items. Use 0 for all items.",
     )
     parser.add_argument(
         "--max-attempts",
@@ -123,15 +133,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def select_single_item(ops: str) -> tuple[str, dict]:
-    requested_files = parse_ops(ops)
-    if len(requested_files) != 1:
-        raise ValueError("--ops must name exactly one operator for agentic evaluation")
+def select_items(args: argparse.Namespace) -> list[tuple[str, dict]]:
+    if args.limit is not None and args.limit < 0:
+        raise ValueError("--limit must be greater than or equal to 0")
 
+    requested_files = parse_ops(args.ops)
     metadata = load_metadata(DEFAULT_AGENTIC_DATA_DIR / DEFAULT_METADATA_FILE)
     items = load_alpaca(DEFAULT_AGENTIC_DATA_DIR, DEFAULT_AGENTIC_DATASET)
-    selected = select_items_by_ops(items, metadata, requested_files)
-    return requested_files[0], selected[0]
+
+    if requested_files and args.limit is not None:
+        print(
+            "warning: both --limit and --ops were provided; ignoring --ops and using --limit",
+            flush=True,
+        )
+        requested_files = []
+
+    if requested_files:
+        selected = select_items_by_ops(items, metadata, requested_files)
+        return list(zip(requested_files, selected))
+
+    if args.limit is None:
+        items = items[:1]
+    elif args.limit:
+        items = items[: args.limit]
+
+    return item_file_pairs(items, metadata)
 
 
 def benchmark_text(item: dict) -> str:
@@ -251,6 +277,16 @@ def compact_result(result: dict) -> dict:
     }
 
 
+def compact_batch_result(result: dict) -> dict:
+    return {
+        "total": result.get("total", 0),
+        "passed": result.get("passed", 0),
+        "failed": result.get("failed", 0),
+        "result_path": result.get("result_path"),
+        "results": [compact_result(item) for item in result.get("results", [])],
+    }
+
+
 def validate_generation_config(provider: str, endpoint: str, api_key: str) -> None:
     if provider == "modal-vllm" and not endpoint:
         raise ValueError("Missing endpoint. Set DEFAULT_ENDPOINT.")
@@ -258,8 +294,7 @@ def validate_generation_config(provider: str, endpoint: str, api_key: str) -> No
         raise ValueError("Missing OpenAI API key. Set OPENAI_API_KEY.")
 
 
-def solve_item(args: argparse.Namespace) -> dict:
-    op_file, item = select_single_item(args.ops)
+def solve_item(args: argparse.Namespace, op_file: str, item: dict) -> dict:
     op_stem = op_file.removesuffix(".py")
 
     endpoint = resolve_endpoint(args.provider)
@@ -363,13 +398,38 @@ def solve_item(args: argparse.Namespace) -> dict:
     return result
 
 
+def solve_batch(args: argparse.Namespace) -> dict:
+    selected = select_items(args)
+    endpoint = resolve_endpoint(args.provider)
+    api_key = resolve_api_key(args.provider)
+    validate_generation_config(args.provider, endpoint, api_key)
+
+    print(f"agentic batch size: {len(selected)}", flush=True)
+    results = []
+    for index, (op_file, item) in enumerate(selected, start=1):
+        print(f"\n=== Agentic item {index}/{len(selected)}: {op_file} ===", flush=True)
+        results.append(solve_item(args, op_file, item))
+
+    batch_result = {
+        "total": len(results),
+        "passed": sum(1 for result in results if result.get("passed")),
+        "failed": sum(1 for result in results if not result.get("passed")),
+        "results": results,
+    }
+    batch_result["result_path"] = str(DEFAULT_AGENTIC_OUTPUT_DIR / "batch_result.json")
+    write_json(DEFAULT_AGENTIC_OUTPUT_DIR / "batch_result.json", batch_result)
+    return batch_result
+
+
 def main() -> None:
     if load_dotenv is not None:
         load_dotenv()
     args = parse_args()
-    result = solve_item(args)
-    print(f"\n=== Agentic result: {'passed' if result.get('passed') else 'failed'} ===")
-    print(json.dumps(result if args.json else compact_result(result), indent=2))
+    result = solve_batch(args)
+    print(
+        f"\n=== Agentic batch result: {result.get('passed')} passed, {result.get('failed')} failed ==="
+    )
+    print(json.dumps(result if args.json else compact_batch_result(result), indent=2))
 
 
 if __name__ == "__main__":
