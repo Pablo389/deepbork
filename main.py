@@ -5,6 +5,12 @@ import json
 import os
 from pathlib import Path
 
+from constants import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_DATASET,
+    DEFAULT_PREDICTIONS_PATH,
+    DEFAULT_TIMEOUT,
+)
 from tritonbench_helpers import (
     DEFAULT_METADATA_FILE,
     load_metadata,
@@ -19,10 +25,7 @@ except ModuleNotFoundError:
     load_dotenv = None
 
 
-DEFAULT_DATA_DIR = Path("data")
-DEFAULT_DATASET = "simp"
-DEFAULT_OUTPUT_PATH = Path("outputs/predictions.jsonl")
-DEFAULT_TIMEOUT = 600
+DEFAULT_OUTPUT_PATH = DEFAULT_PREDICTIONS_PATH
 
 PROMPT_HEADER = (
     "You are an expert in Triton programming, capable of writing Triton kernels "

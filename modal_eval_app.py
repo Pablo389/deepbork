@@ -19,20 +19,32 @@ from pathlib import Path
 
 import modal
 
+from constants import (
+    DEFAULT_MODAL_APP_NAME,
+    DEFAULT_MODAL_VOLUME,
+    EVAL_JSON_END,
+    EVAL_JSON_START,
+)
 from evaluation.model import PHASE_ORDER, PHASES
 from tritonbench_helpers import DEFAULT_METADATA_FILE, load_metadata, prediction_files
 
 
-APP_NAME = "deepbork-eval"
+APP_NAME = DEFAULT_MODAL_APP_NAME
 TRITONBENCH_REPO = "https://github.com/thunlp/TritonBench.git"
 
-DEFAULT_GPU = os.environ.get("DEEPBORK_EVAL_GPU", os.environ.get("DEEPBORK_PHASE1_GPU", "A100-40GB"))
-VOLUME_NAME = os.environ.get("DEEPBORK_MODAL_VOLUME", "deepbork-phase1-data")
-SCALEDOWN_WINDOW = int(os.environ.get("DEEPBORK_EVAL_SCALEDOWN_WINDOW", "180"))
+# Deployment knobs live in code so Modal captures them when the app is deployed.
+# Change these constants before `modal deploy modal_eval_app.py` to adjust
+# compute, artifact storage, or warm-container behavior.
+#
+# Modal references:
+# - GPU selection: https://modal.com/docs/guide/gpu
+# - Scaling and `scaledown_window`: https://modal.com/docs/guide/scale
+# - Cold starts and warm containers: https://modal.com/docs/guide/cold-start
+DEFAULT_GPU = "A100-40GB"
+VOLUME_NAME = DEFAULT_MODAL_VOLUME
+SCALEDOWN_WINDOW = 180
 DATA_DIR = "/data"
 REPO_DIR = "/opt/TritonBench"
-EVAL_JSON_START = "DEEPBORK_EVAL_JSON_START"
-EVAL_JSON_END = "DEEPBORK_EVAL_JSON_END"
 
 
 PATCH_CALL_ACC = (
@@ -76,6 +88,7 @@ image = (
     )
     .add_local_python_source("tritonbench_helpers")
     .add_local_python_source("evaluation")
+    .add_local_python_source("constants")
 )
 
 app = modal.App(APP_NAME, image=image)

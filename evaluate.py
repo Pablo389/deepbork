@@ -2,32 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
+from constants import (
+    DEFAULT_MODAL_APP,
+    DEFAULT_MODAL_APP_NAME,
+    DEFAULT_MODAL_BIN,
+    DEFAULT_MODAL_VOLUME,
+    DEFAULT_OUTPUT_SUBDIRS,
+    DEFAULT_PREDICTIONS_PATH,
+    EVAL_JSON_END,
+    EVAL_JSON_START,
+    VALID_MODES,
+)
 from evaluation.model import PHASE_ORDER, PHASES
-
-
-DEFAULT_MODAL_APP = Path(__file__).with_name("modal_eval_app.py")
-DEFAULT_MODAL_APP_NAME = "deepbork-eval"
-DEFAULT_MODAL_BIN = "modal"
-DEFAULT_MODAL_VOLUME = "deepbork-phase1-data"
-EVAL_JSON_START = "DEEPBORK_EVAL_JSON_START"
-EVAL_JSON_END = "DEEPBORK_EVAL_JSON_END"
-DEFAULT_PHASE1_OUTPUT_SUBDIR = "results/phase1"
-DEFAULT_PHASE2_OUTPUT_SUBDIR = "results/phase2"
-DEFAULT_PHASE3_OUTPUT_SUBDIR = "results/phase3"
-DEFAULT_ALL_OUTPUT_SUBDIR = "results/all"
-DEFAULT_OUTPUT_SUBDIRS = {
-    "phase1": DEFAULT_PHASE1_OUTPUT_SUBDIR,
-    "phase2": DEFAULT_PHASE2_OUTPUT_SUBDIR,
-    "phase3": DEFAULT_PHASE3_OUTPUT_SUBDIR,
-    "all": DEFAULT_ALL_OUTPUT_SUBDIR,
-}
-STAGE_ORDER = PHASE_ORDER
-VALID_MODES = (*PHASE_ORDER, "all")
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--predictions",
         type=Path,
-        default=Path("outputs/predictions.jsonl"),
+        default=DEFAULT_PREDICTIONS_PATH,
         help="Local predictions.jsonl produced by main.py.",
     )
     parser.add_argument(
@@ -143,9 +133,8 @@ def _upload_local_predictions_to_volume(local_path: Path, remote: str) -> str:
         raise FileNotFoundError(local_path)
 
     modal = _modal_module()
-    volume_name = os.environ.get("DEEPBORK_MODAL_VOLUME", DEFAULT_MODAL_VOLUME)
     print(f"uploading {local_path} -> volume://{remote}", flush=True)
-    volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+    volume = modal.Volume.from_name(DEFAULT_MODAL_VOLUME, create_if_missing=True)
     with volume.batch_upload(force=True) as batch:
         batch.put_file(str(local_path), remote)
     return remote
@@ -160,7 +149,6 @@ def _pipeline_predictions_upload_path(output_subdir: str) -> str:
 
 def run_deployed_pipeline(predictions: Path, output_subdir: str) -> dict:
     modal = _modal_module()
-    app_name = os.environ.get("DEEPBORK_MODAL_APP_NAME", DEFAULT_MODAL_APP_NAME)
     predictions_path = _upload_local_predictions_to_volume(
         predictions,
         _pipeline_predictions_upload_path(output_subdir),
@@ -170,7 +158,7 @@ def run_deployed_pipeline(predictions: Path, output_subdir: str) -> dict:
         "predictions_path": predictions_path,
         "output_subdir": output_subdir,
     }
-    function = modal.Function.from_name(app_name, "run_pipeline_remote")
+    function = modal.Function.from_name(DEFAULT_MODAL_APP_NAME, "run_pipeline_remote")
     return function.remote(request)
 
 

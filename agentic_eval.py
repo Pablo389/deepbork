@@ -5,8 +5,13 @@ import json
 import os
 from pathlib import Path
 
-from main import (
+from constants import (
     DEFAULT_DATA_DIR,
+    DEFAULT_DATASET,
+    DEFAULT_TIMEOUT,
+    STAGE_ORDER,
+)
+from main import (
     build_messages,
     extract_code,
     generate_text,
@@ -16,7 +21,6 @@ from main import (
     resolve_model,
 )
 from evaluate import (
-    STAGE_ORDER,
     evaluate_local,
     failed_stage,
     is_passed,
@@ -39,11 +43,8 @@ except ModuleNotFoundError:
     load_dotenv = None
 
 
-DEFAULT_AGENTIC_DATA_DIR = DEFAULT_DATA_DIR
-DEFAULT_AGENTIC_DATASET = "simp"
 DEFAULT_AGENTIC_OUTPUT_DIR = Path("outputs/agentic_eval")
 DEFAULT_EVAL_OUTPUT_PREFIX = "results/eval/agentic"
-DEFAULT_TIMEOUT = 600
 AGENTIC_TARGETS = ("phase1", "all")
 PASS_STAGE = {
     "phase1": "phase1",
@@ -138,8 +139,8 @@ def select_items(args: argparse.Namespace) -> list[tuple[str, dict]]:
         raise ValueError("--limit must be greater than or equal to 0")
 
     requested_files = parse_ops(args.ops)
-    metadata = load_metadata(DEFAULT_AGENTIC_DATA_DIR / DEFAULT_METADATA_FILE)
-    items = load_alpaca(DEFAULT_AGENTIC_DATA_DIR, DEFAULT_AGENTIC_DATASET)
+    metadata = load_metadata(DEFAULT_DATA_DIR / DEFAULT_METADATA_FILE)
+    items = load_alpaca(DEFAULT_DATA_DIR, DEFAULT_DATASET)
 
     if requested_files and args.limit is not None:
         print(
